@@ -5,7 +5,7 @@ The A/B that motivated the lobe combine now shipped in gnssFleetDll.hpp / combdl
 what those form; A is what they formed before). Kept as the on-sky instrument for the same
 question: XCOH and P(B)/P(A)*n_inst say whether the senders' phi0 puts them on one reference.
 
-    scripts/gnss/lobe_dll_ab.py [--chain gps_l5] [--windows 32] [--probes 6,11,21]
+    scripts/gnss/site/lobe_dll_ab.py [--chain gps_l5] [--windows 32] [--probes 6,11,21]
 
 The fleet discriminator is formed from the comb -- Early/Prompt/Late per CHANNEL, per record,
 per sender. Two reductions of those numbers to one (E, P, L) per PRN are compared here:
@@ -47,6 +47,7 @@ sys.path.insert(
     0,
     os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
+        "..",
         "..",
         "..",
         "python",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep the running GNSS nodes' bad-input list on bffs's. Cron, on the gnss VM.
 
-    */5 * * * *  /home/kvand/gnss/kotekan/scripts/gnss/bad_inputs_cron.py
+    */5 * * * *  /home/kvand/gnss/kotekan/scripts/gnss/site/bad_inputs_cron.py
 
 WHY. choco relays bffs's list to every node in its cx group EXCEPT nodes in maintenance mode, and
 ours are in maintenance mode: choco would also push configs we must not have overwritten. So a bffs
@@ -31,7 +31,9 @@ import sys
 import time
 import urllib.request
 
-K = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+K = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 sys.path.insert(0, os.path.join(K, "config"))
 import bffs_bad_inputs  # noqa: E402
 

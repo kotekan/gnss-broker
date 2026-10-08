@@ -41,7 +41,7 @@ import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "scripts", "gnss"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "scripts", "gnss"))
 from gnss_broker import combdll, telem  # noqa: E402
 
 T_REC = 2048 * 5.12e-6

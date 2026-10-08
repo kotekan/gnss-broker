@@ -1,6 +1,6 @@
 """Peer-comparison audit -- driven by DECISION SITES, not by reduction calls.
 
-    python3 scripts/gnss/peer_audit.py
+    python3 scripts/gnss/site/peer_audit.py
 
 Companion to docs/CHORD_PEER_COMPARISON_PURGE.md. KV's rule (2026-08-27): a peer comparison
 can never tell us about a given signal, only fleet-relative properties, so none is justified

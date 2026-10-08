@@ -33,7 +33,10 @@ AGG_HOST = "cf06"
 AGG_LOG = "/tmp/gnss_agg_final.log"
 TAPS = ["gnss0_srch_tap", "gnss1_srch_tap"]
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config")
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config"
+    ),
 )
 from gnss_record_layout import record_stride  # noqa: E402
 

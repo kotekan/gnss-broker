@@ -1,7 +1,7 @@
 #!/bin/bash
 # Bring the GNSS TELEMETRY GATHER up on the host it is run from (task #59; cf06 in practice).
 #
-#   scripts/gnss/gather_up.sh [config] [log]
+#   scripts/gnss/site/gather_up.sh [config] [log]
 #
 # The gather is the broker-side half of the frame-synced tracker transport: one bufferRecv for
 # the whole fleet on :11060, and GnssTelemGather handing the frames to the PYTHON broker on
@@ -108,7 +108,7 @@ fi
 # run_component.sh, which systemd also execs. This script keeps what systemd does not do --
 # the host guard, the config preflight, the log rotation and the post-start health check.
 GNSS_BIN="$BIN" GNSS_GATHER_CFG="$CFG" GNSS_GATHER_REST="$REST" \
-    nohup setsid "$K/scripts/gnss/run_component.sh" gather > "$LOG" 2>&1 < /dev/null &
+    nohup setsid "$K/scripts/gnss/site/run_component.sh" gather > "$LOG" 2>&1 < /dev/null &
 disown
 sleep 5
 pgrep -f "kotekan[^ ]* --config.*[g]ather" > /dev/null \

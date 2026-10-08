@@ -6,8 +6,8 @@
 # independent transcripts, so they parallelise perfectly; wall time becomes the slowest single
 # fixture (~90 s, the 172-cycle b2a).
 #
-#   scripts/gnss/gate.sh            # check every fixture against its golden digest
-#   scripts/gnss/gate.sh -v         # ... and show each fixture's line
+#   scripts/gnss/site/gate.sh            # check every fixture against its golden digest
+#   scripts/gnss/site/gate.sh -v         # ... and show each fixture's line
 #
 # Exit 0 only if EVERY fixture reports EQUIVALENT. Anything else -- a moved digest, a crash, a
 # missing blob -- is a failure, because "the gate did not run" and "the gate passed" must never

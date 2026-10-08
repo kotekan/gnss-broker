@@ -16,10 +16,10 @@
 #   3. push (eop_push.sh, which reads the table back) only to qualifying nodes whose live table
 #      ends EARLIER than the staged one. Re-running is a no-op.
 #
-#   crontab:  17 * * * *  /home/kvand/gnss/kotekan/scripts/gnss/eop_cron.sh
+#   crontab:  17 * * * *  /home/kvand/gnss/kotekan/scripts/gnss/site/eop_cron.sh
 #   env:      GNSS_NODES (default the six), EOP_LOG (default /var/tmp/gnss-logs/eop_cron.log)
 set -u
-K=$(cd "$(dirname "$0")/../.." && pwd)
+K=$(cd "$(dirname "$0")/../../.." && pwd)
 NODES=${GNSS_NODES:-"cx19 cx27 cx42 cx43 cx44 cx51"}
 LOG=${EOP_LOG:-/var/tmp/gnss-logs/eop_cron.log}
 F=/var/tmp/gnss-logs/eop-state.json
@@ -69,7 +69,7 @@ except Exception:
 done
 
 if [ -n "$PUSH" ]; then
-    GNSS_NODES="${PUSH# }" "$K/scripts/gnss/eop_push.sh" "$F"
+    GNSS_NODES="${PUSH# }" "$K/scripts/gnss/site/eop_push.sh" "$F"
 else
     echo "  nothing to push"
 fi

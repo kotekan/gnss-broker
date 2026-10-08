@@ -22,7 +22,7 @@
 #
 # ⚠️ RUNS ON cf06 ONLY. The raw tree is on /mnt/cs00 and the nodes are production trackers.
 #
-# usage:  ssh cf06 '/home/kvand/gnss/kotekan/scripts/gnss/cubecompact_up.sh'
+# usage:  ssh cf06 '/home/kvand/gnss/kotekan/scripts/gnss/site/cubecompact_up.sh'
 #         CUBE_UTC0=<s> CUBE_ROOT=/mnt/cs00/data/kvand/gnss_cube_test ... (a test run)
 set -u
 K=/home/kvand/gnss/kotekan
@@ -72,7 +72,7 @@ done
 mkdir -p "$ROOT/l0" "$(dirname "$LOG")"
 [ -f "$LOG" ] && mv "$LOG" "$LOG.$(date -u +%Y%m%d_%H%M%S)"
 
-nohup setsid "$K/scripts/gnss/cubecompact_loop.sh" "$PY" "$TOOL" "$RAW" "$ROOT" "$UTC0" "$PERIOD" \
+nohup setsid "$K/scripts/gnss/site/cubecompact_loop.sh" "$PY" "$TOOL" "$RAW" "$ROOT" "$UTC0" "$PERIOD" \
     >> "$LOG" 2>&1 &
 sleep 3
 if pgrep -f "[c]ubecompact_loop.sh" >/dev/null; then

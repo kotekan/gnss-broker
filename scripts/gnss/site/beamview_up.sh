@@ -2,7 +2,7 @@
 # Serve the BEAM-CUBE VIEWER on cf06 -- the static page that draws the healpix beam maps
 # exported by gnss_beam_cube.py (python/scripts/gnss/beam_cube_viewer/).
 #
-#   ssh cf06 '/home/kvand/gnss/kotekan/scripts/gnss/beamview_up.sh'     # http://cf06:8877  (877 is privileged)
+#   ssh cf06 '/home/kvand/gnss/kotekan/scripts/gnss/site/beamview_up.sh'     # http://cf06:8877  (877 is privileged)
 #
 # WHAT IT SERVES: $WEB/index.json + cube_<day>.json/.bin (written by `gnss_beam_cube.py
 # export`) and symlinks to the page sources in the repo, so editing beamcube.js in the tree

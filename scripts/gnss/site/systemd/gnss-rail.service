@@ -1,6 +1,6 @@
 [Unit]
 Description=CHORD GNSS per-channel rail and band-power recorder (voltage-tap rf_stats, every pass)
-Documentation=file:///home/kvand/gnss/kotekan/scripts/gnss/rail_watch.py
+Documentation=file:///home/kvand/gnss/kotekan/scripts/gnss/site/rail_watch.py
 # This host only: the user copies sit in the NFS-shared home (see gnss-stack.target).
 ConditionHost=|gnss
 ConditionHost=|gnss.site.chord-observatory.ca
@@ -10,7 +10,7 @@ PartOf=gnss-stack.target
 [Service]
 Type=simple
 # Through run_component.sh like every stack unit: argv and environment from one definition.
-ExecStart=/home/kvand/gnss/kotekan/scripts/gnss/run_component.sh rail
+ExecStart=/home/kvand/gnss/kotekan/scripts/gnss/site/run_component.sh rail
 Restart=on-failure
 RestartSec=10
 MemoryAccounting=yes

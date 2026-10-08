@@ -1,7 +1,7 @@
 #!/bin/bash
 # Bring the GNSS BEAM-CUBE ARCHIVER up on the host it is run from (cf06 in practice).
 #
-#   scripts/gnss/cubearch_up.sh [config] [log]
+#   scripts/gnss/site/cubearch_up.sh [config] [log]
 #
 # This is the far side of the beam-cube push leg: one bufferRecv on :11070 for the whole fleet's
 # completed ~1 s (subband x element) windows, and a rawFileWrite that lands them on cs00. It is

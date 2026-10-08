@@ -30,7 +30,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 BROKER = os.path.normpath(
     os.path.join(
-        HERE, "..", "..", "python", "scripts", "gnss", "gps_distributed_broker.py"
+        HERE, "..", "..", "..", "python", "scripts", "gnss", "gps_distributed_broker.py"
     )
 )
 PKG = os.path.join(os.path.dirname(BROKER), "gnss_broker")

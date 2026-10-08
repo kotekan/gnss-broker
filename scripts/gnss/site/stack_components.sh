@@ -153,7 +153,7 @@ gnss_component() {
         # Per-channel 4+4b rail fraction and band power from every GPU's voltage tap, every pass
         # (1 s on the nodes). Standalone: stdlib only, reads the nodes' rf_stats and nothing else,
         # so it can never touch the control path.
-        GNSS_EXEC=(/usr/bin/python3 -u "$GNSS_K/scripts/gnss/rail_watch.py" record
+        GNSS_EXEC=(/usr/bin/python3 -u "$GNSS_K/scripts/gnss/site/rail_watch.py" record
                    --out "$GNSS_OBS_OUT/rf_chan_%Y%m%d.jsonl")
         ;;
 

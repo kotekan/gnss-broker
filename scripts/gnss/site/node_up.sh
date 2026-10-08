@@ -13,8 +13,8 @@
 # usage:  node_up.sh <node> [up|down|restart|status]      default: up
 #         node_up.sh cx51
 #         node_up.sh cx51 status
-#         for n in cx42 cx43 cx44 cx47 cx51 cx52; do scripts/gnss/node_up.sh $n; done
-#         for n in cx19 cx27 cx42 cx43 cx44 cx51; do scripts/gnss/node_up.sh $n restart; done
+#         for n in cx42 cx43 cx44 cx47 cx51 cx52; do scripts/gnss/site/node_up.sh $n; done
+#         for n in cx19 cx27 cx42 cx43 cx44 cx51; do scripts/gnss/site/node_up.sh $n restart; done
 #
 # USE `restart` RATHER THAN down-then-up. sudo's credential cache is per-TTY and `ssh -t`
 # allocates a fresh one each call, so a down loop followed by an up loop prompts for the
@@ -44,7 +44,7 @@ ACT=${2:-up}
 # binary. Use them to bring a node up on the PROFILING config without editing anything:
 #
 #   GNSS_CFG=$K/config/generated/chord_gnss_cx19_prof.yaml GNSS_LOG=/tmp/gnss_prof.log \
-#       scripts/gnss/node_up.sh cx19
+#       scripts/gnss/site/node_up.sh cx19
 #
 # Give the profiling run its OWN log: it emits one INFO block per GPU frame per GPU (~760
 # lines/s), which buries /tmp/gnss_node.log. And note the log must not already exist owned by a
@@ -119,7 +119,7 @@ PYEOP
             echo "  Regenerate all six and gate them, then start:" >&2
             echo "    python3 $K/scripts/gnss/gen_fleet.py $K/config/gnss_fleet_chord.yaml" >&2
             echo "    python3 $K/scripts/gnss/gen_fleet.py $K/config/gnss_fleet_chord.yaml --check" >&2
-            echo "  and push the live table once the nodes answer:  $K/scripts/gnss/eop_push.sh" >&2
+            echo "  and push the live table once the nodes answer:  $K/scripts/gnss/site/eop_push.sh" >&2
             echo "  (GNSS_SKIP_PREFLIGHT=1 overrides, deliberately.)" >&2
             exit 1
         fi

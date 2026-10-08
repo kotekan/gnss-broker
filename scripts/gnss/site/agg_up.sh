@@ -89,7 +89,7 @@ fi
 # THIS path, which is what this script has always done; the systemd unit leaves it off. That
 # difference is now visible in one place instead of being a silent divergence.
 GNSS_BIN="$BIN" GNSS_AGG_CFG="$CFG" GNSS_SEARCH_PROFILE=1 \
-    nohup setsid "$K/scripts/gnss/run_component.sh" aggregator > "$LOG" 2>&1 < /dev/null &
+    nohup setsid "$K/scripts/gnss/site/run_component.sh" aggregator > "$LOG" 2>&1 < /dev/null &
 disown
 sleep 8
 pgrep -f "kotekan[^ ]* --config.*[a]gg" > /dev/null \

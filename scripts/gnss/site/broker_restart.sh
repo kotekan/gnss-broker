@@ -151,7 +151,7 @@ nohup setsid bash -c '
         # which the systemd unit also execs. The BLAS cap below used to live only in this
         # file as an `export`, which is exactly why the unit could drop it (#134).
         GNSS_PY="$PY" GNSS_CHAINS_YAML="$CHAINS" \
-            "$K/scripts/gnss/run_component.sh" broker "$@" >> "$LOG" 2>&1 < /dev/null &
+            "$K/scripts/gnss/site/run_component.sh" broker "$@" >> "$LOG" 2>&1 < /dev/null &
         echo $! > "$BROKER_PIDFILE"
         wait $!
         rc=$?

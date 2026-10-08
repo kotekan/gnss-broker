@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """#49: does the deep gate actually pull satellites IN? Armed PRNs vs in-chain controls.
 
-    scripts/gnss/deep_gate_watch.py --gate 4,9,27 [--chain gps_l5] [--hours 6]
-    scripts/gnss/deep_gate_watch.py --report /tmp/deep_gate_gps_l5.jsonl   # analyse only
+    scripts/gnss/site/deep_gate_watch.py --gate 4,9,27 [--chain gps_l5] [--hours 6]
+    scripts/gnss/site/deep_gate_watch.py --report /tmp/deep_gate_gps_l5.jsonl   # analyse only
 
 Referenced by config/gnss_chains_chord.yaml since the gal_e5a arm and never actually written;
 written 2026-08-15 when the gate was armed on gps_l5.

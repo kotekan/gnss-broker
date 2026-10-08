@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start the ONE CHORD GNSS viewer -- every constellation, one instance (task #27 M6).
 #
-#   scripts/gnss/viewer_up.sh            # http://cf06:8080
+#   scripts/gnss/site/viewer_up.sh            # http://cf06:8080
 #
 # WHAT THIS REPLACES: two instances, one per broker port (8080 -> 12060 GPS, 8081 -> 12061
 # E5a), because a publisher served one chain per port. The broker now publishes every chain
@@ -45,7 +45,7 @@ sleep 2
 # load-bearing: livebeam_server.py resolves its static assets relative to it. Extra "$@" args
 # still pass through, after the defined ones.
 GNSS_VIEWER_PORT="$PORT" GNSS_BROKER_PORT="$REST" \
-    nohup setsid "$K/scripts/gnss/run_component.sh" viewer "$@" > "$LOG" 2>&1 < /dev/null &
+    nohup setsid "$K/scripts/gnss/site/run_component.sh" viewer "$@" > "$LOG" 2>&1 < /dev/null &
 disown
 sleep 6
 
