@@ -213,6 +213,26 @@ class TestBandOf(unittest.TestCase):
         ):
             self.assertEqual(esr.band_of(stage), band, stage)
 
+    def test_the_band_is_the_chains_row(self):
+        """The band comes from the chain's row in the chains table, the one the generator copies
+        into the assembler, not from the chain key; a chain without a row is refused."""
+        rows = [
+            r._replace(shared_ref_band="l1ca") if r.key == "sbas_l1" else r
+            for r in esr.gnss_chain_table.load()
+        ]
+        saved = dict(esr._BANDS)
+        esr._BANDS.clear()
+        esr._BANDS.update({r.key: r.shared_ref_band for r in rows})
+        try:
+            self.assertEqual(esr.band_of("gnss0_sbas_l1_n2assemble"), "l1ca")
+            del esr._BANDS["gal_e5a"]
+            with self.assertRaises(SystemExit) as e:
+                esr.band_of("gnss0_gal_e5a_n2assemble")
+            self.assertIn("gal_e5a has no row", str(e.exception))
+        finally:
+            esr._BANDS.clear()
+            esr._BANDS.update(saved)
+
 
 class FakeNode:
     """urllib.request.urlopen for set_elem_sum_shared_ref: records (url, body) per POST."""
@@ -290,6 +310,34 @@ class TestPostZeros(unittest.TestCase):
         )
         self.assertEqual(esr.config_zeros("cx51", "gnss0_n2assemble"), {1, 3})
         self.assertEqual(esr.config_zeros("cx51", "gnss1_e5a_n2assemble"), set())
+
+    def test_a_record_host_is_asked_by_chain(self):
+        """A row of gnss<g>_records named by its chain is asked at its host, by chain; the body
+        it posts is the row's own."""
+        with open(esr.GEN % "node-a", "w") as fh:
+            yaml.safe_dump(
+                {
+                    "gnss0_records": {
+                        "kotekan_stage": "GnssGpuRecordAssemble",
+                        "elem_positions_epoch": "E",
+                        "chains": {"gnss0_gps_l5": {"elem_sum_shared_ref": [0.0] * 8}},
+                    }
+                },
+                fh,
+            )
+        self.assertEqual(
+            esr.request("node-a", "gnss0_gps_l5_n2assemble", "get_elem_cal")[0],
+            "http://node-a:12048/gnss0_records/get_elem_cal?chain=gps_l5",
+        )
+        ok, _ = esr.post_note(
+            "node-a", "gnss0_gps_l5_n2assemble", self.REF, "live", "test"
+        )
+        url, body = self.node.posts[0]
+        self.assertEqual(
+            url, "http://node-a:12048/gnss0_records/set_elem_sum_shared_ref"
+        )
+        self.assertEqual(body["chain"], "gps_l5")
+        self.assertEqual(body["body"]["ref"], [[0.0, 0.0]] * 4)
 
     def test_post_applies_the_configs_zeros(self):
         with contextlib.redirect_stdout(io.StringIO()):

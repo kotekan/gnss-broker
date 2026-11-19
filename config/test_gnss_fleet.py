@@ -265,6 +265,99 @@ def test_repo_chains_follow_the_fleet():
         any("cx47, which is not in the fleet list" in p for p in probs),
         "--check names a host outside the fleet",
     )
+    with tempfile.TemporaryDirectory() as d:
+        cfg = chains_cfg()
+        cfg["common"]["node-hosts"] = "http://node-a:12048/gnss0_records"
+        path = os.path.join(d, "chains.yaml")
+        with open(path, "w") as fh:
+            yaml.safe_dump(cfg, fh)
+        probs = gen_fleet.check_chains(fl, path)
+    check(
+        any("node-hosts is written by hand" in p for p in probs),
+        "--check refuses hand-written node hosts (%s)" % probs,
+    )
+
+
+def test_host_bases():
+    """The manifest's host flags, as the generator resolves them (true in common or on the node,
+    never unset by the other), give each node's hosted stages and its halves' host bases; no
+    flag, no host, and the chains yaml's node-hosts expands to null."""
+    cfg = dict(chains_cfg(), common={"rest-url": "fleet", "node-hosts": "fleet"})
+    a, b, c = SIX[0], SIX[4], SIX[5]  # nodes of the site table
+    plain = gf.Fleet(manifest({a: {}, b: {}}), site())
+    check(
+        plain.hosted(a) == [] and plain.host_bases() == [], "no host flag: no host",
+    )
+    check(
+        gf.expand_chains(cfg, plain)["common"]["node-hosts"] is None,
+        "no host: node-hosts null, so the broker gets no --node-hosts",
+    )
+    m = manifest(
+        {
+            a: {"inject-host": True, "combine-host": True},
+            b: {"record-host": False},
+            c: {},
+        }
+    )
+    m["common"] = dict(m["common"], **{"record-host": True})
+    fl = gf.Fleet(m, site())
+    check(
+        fl.hosted(a) == ["inject", "n2assemble", "n2combine"]
+        and fl.hosted(b) == ["n2assemble"]
+        and fl.hosted(c) == ["n2assemble"],
+        "common and node flags together; a node's false does not unset common's true",
+    )
+    want = {
+        "http://%s:12048/gnss%d_%s" % (a, g, h)
+        for g in (0, 1)
+        for h in ("inject", "records", "combine")
+    } | {"http://%s:12048/gnss%d_records" % (n, g) for n in (b, c) for g in (0, 1)}
+    got = fl.host_bases()
+    check(
+        set(got) == want and len(got) == len(want),
+        "every node's halves, each hosted stage (%s)" % got,
+    )
+    check(
+        gf.expand_chains(cfg, fl)["common"]["node-hosts"].split(",") == got,
+        "node-hosts: fleet expands to them",
+    )
+    sys.path.insert(0, os.path.join(ROOT, "python", "scripts", "gnss"))
+    from gnss_broker import node_api
+
+    check(
+        {stage: name for stage, name in gf.HOST_FLAGS.values()} == node_api.HOSTS,
+        "the host names are the broker's (node_api.HOSTS)",
+    )
+
+
+def test_config_host_bases():
+    """A generated config's hosts that serve their rows by chain: the record and combine hosts
+    by their names, an inject host by its rows' half."""
+    asm = {"kotekan_stage": "GnssGpuRecordAssemble"}
+    cfg = {
+        "gnss0_records": dict(asm, chains={"gnss0_gps_l5": {}}),
+        "gnss1_gps_l5_n2assemble": asm,
+        "gnss1_combine": {"kotekan_stage": "GnssCoherentCombiner", "chains": {}},
+        "gnss0_gps_l5_n2combine": {"kotekan_stage": "GnssCoherentCombiner"},
+        "gnss0_n2dual": {
+            "commands": [
+                {"name": "cudaGnssInject", "chains": {"gnss0_gps_l5": {}}},
+                {"name": "cudaCorrelatorDual"},
+            ]
+        },
+        "gnss1_n2dual": {"commands": [{"name": "cudaGnssInject"}]},
+        "gnss0_telem": {"kotekan_stage": "GnssTelemPack", "chains": {}},
+    }
+    got = gf.config_host_bases(cfg, "http://node-a:12048")
+    check(
+        got
+        == [
+            "http://node-a:12048/gnss0_inject",
+            "http://node-a:12048/gnss0_records",
+            "http://node-a:12048/gnss1_combine",
+        ],
+        "the hosted inject, records and combine, no other (%s)" % got,
+    )
 
 
 def test_built_instances_matches_derived():
@@ -301,9 +394,109 @@ def test_built_instances_matches_derived():
     )
 
 
+def test_chains_are_the_table():
+    """The chains the nodes build are the chains table's rows, the primary first, and the
+    manifest's common may not carry the old extra-signal list beside them."""
+    fl = six()
+    sig = fl.tracker_signals()
+    check(
+        list(sig) == [r.key for r in fl.chains]
+        and sig["gps_l5"] == ("GPS_L5_Q_NH", "_gps_l5")
+        and sig["glo_l2of"] == ("GLO_L2OF_MC", "_glo_l2of"),
+        "tracker_signals: every row, primary first, descriptor and tag (%s)"
+        % list(sig),
+    )
+    m = manifest({"cx19": {}})
+    m["common"] = dict(m["common"], **{"extra-signal": ["GAL_E5A_Q_CS:2"]})
+    check(refused(m, "common sets extra-signal"), "an extra-signal list is refused")
+    m = manifest({"cx19": {}})
+    del m["chains"]
+    check(refused(m, "no chains"), "a manifest without chains is refused")
+    m = manifest({"cx19": {}})
+    m["chains"] = m["chains"][1:]
+    check(
+        refused(m, "the first chains row is gal_e5a, but the node table's primary"),
+        "a first row that is not the node table's primary is refused",
+    )
+
+
+def test_broker_dll_spacing_is_the_tables():
+    """load_chains gives every chain its row's dll-spacing, and refuses a dll-spacing written
+    in the chains yaml (a second copy that can drift from the node taps) or a chain without a
+    row; gen_fleet --check names a row the broker runs no chain for."""
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "gnss_fleet_chord.yaml"), "w") as fh:
+            yaml.safe_dump(manifest({h: {} for h in SIX}), fh)
+        with open(os.path.join(d, "chord_gnss_node.yaml"), "w") as fh:
+            yaml.safe_dump(site(), fh)
+        path = os.path.join(d, "chains.yaml")
+
+        def load(cfg):
+            with open(path, "w") as fh:
+                yaml.safe_dump(cfg, fh)
+            try:
+                return gf.load_chains(path)
+            except gf.FleetError as e:
+                return str(e)
+
+        out = load(chains_cfg())
+        check(
+            out["chains"]["gps_l2c"]["dll-spacing"] == 0.33
+            and out["chains"]["gps_l5"]["dll-spacing"] == 0.5,
+            "each chain's dll-spacing is its row's",
+        )
+        cfg = chains_cfg()
+        cfg["chains"]["gps_l2c"]["dll-spacing"] = 0.33
+        got = load(cfg)
+        check(
+            "chains.gps_l2c sets dll-spacing" in str(got),
+            "a dll-spacing in the chains yaml is refused (%s)" % got,
+        )
+        cfg = chains_cfg()
+        cfg["common"]["dll-spacing"] = 0.5
+        got = load(cfg)
+        check("common sets dll-spacing" in str(got), "...in common too (%s)" % got)
+        cfg = chains_cfg()
+        cfg["chains"]["gps_l9"] = {"signal": "gps_l9"}
+        got = load(cfg)
+        check(
+            "chains.gps_l9: gps_l9 has no row" in str(got),
+            "a chain without a row is refused (%s)" % got,
+        )
+        cfg = chains_cfg()
+        cfg["common"]["signal"] = "gps_l2c"
+        cfg["chains"]["l2c_b"] = {}
+        got = load(cfg)
+        check(
+            not isinstance(got, str) and got["chains"]["l2c_b"]["dll-spacing"] == 0.33,
+            "a chain without its own signal takes common's row (%s)"
+            % (got if isinstance(got, str) else got["chains"]["l2c_b"]),
+        )
+    probs = gen_fleet.check_chains(six())
+    check(probs == [], "the repo's chains yaml runs every row (%s)" % probs)
+    with tempfile.TemporaryDirectory() as d:
+        with open(gen_fleet.CHAINS) as fh:
+            raw = yaml.safe_load(fh)
+        del raw["chains"]["glo_l2of"]
+        raw["chains"]["gps_l2c"]["dll-spacing"] = 0.4
+        raw["chains"]["gal_e5a"]["node-hosts"] = "fleet"
+        path = os.path.join(d, "chains.yaml")
+        with open(path, "w") as fh:
+            yaml.safe_dump(raw, fh)
+        probs = gen_fleet.check_chains(six(), path)
+    check(
+        any("chains.gps_l2c sets dll-spacing" in p for p in probs)
+        and any("row glo_l2of" in p for p in probs)
+        and any("chains.gal_e5a: node-hosts is the fleet's" in p for p in probs),
+        "--check names a hand dll-spacing, a row without a broker chain and a chain's "
+        "own node-hosts (%s)" % probs,
+    )
+
+
 def test_stage_chain():
     """stage_chain reads the chain from a stage name of either generation: the broker key, or
-    the band tag that came before it (no tag = the primary, l5 = SBAS L5)."""
+    the band tag that came before it (no tag = the primary, l5 = SBAS L5), and no chain from a
+    host's name."""
     cases = [
         ("gnss0_gal_e5a_n2assemble", "n2assemble", "gal_e5a"),
         ("gnss0_e5a_n2assemble", "n2assemble", "gal_e5a"),
@@ -321,6 +514,21 @@ def test_stage_chain():
         ("gnss0_gal_e5a_n2combine", "n2assemble", None),
         ("gnss0_gps_l9_n2assemble", "n2assemble", None),
         ("gnss0_x_n2assemble", "n2assemble", None),
+        ("node-a/gnss1_gal_e5b_n2combine", "n2combine", "gal_e5b"),
+        ("gnss0_n2combine", "n2combine", "gps_l5"),
+        ("gnss1_n2ctl", "n2ctl", "gps_l5"),
+        ("/gnss0_telem_pack", "telem_pack", "gps_l5"),
+        ("gnss0_gps_l5_inject", "inject", "gps_l5"),
+        ("gnss0_e5a_inject", "inject", "gal_e5a"),
+        # A host's name is no chain's, though the untagged primary once had it.
+        ("gnss0_inject", "inject", None),
+        ("/gnss1_inject", "inject", None),
+        ("gnss0_records", "records", None),
+        ("gnss0_combine", "combine", None),
+        ("gnss1_telem", "telem", None),
+        ("gnss0_telem_send", "telem_send", None),
+        ("node-a//gnss1_cube_send", "cube_send", None),
+        ("gnss0_gps_l5_telem_send", "telem_send", "gps_l5"),
     ]
     for name, stage, want in cases:
         got = gf.stage_chain(name, stage)
@@ -334,7 +542,9 @@ def test_stage_chain():
 
 
 def test_check_instances_names_a_mismatch():
-    fl = gf.Fleet(manifest({"cx44": {}}, {"common": {}}), site())
+    m = manifest({"cx44": {}}, {"common": {}})
+    m["chains"] = m["chains"][:1]
+    fl = gf.Fleet(m, site())
     asm = {"kotekan_stage": "GnssGpuRecordAssemble"}
     text = "# h\n" + yaml.safe_dump({"gnss0_n2assemble": asm, "gnss1_n2assemble": asm})
     check(
