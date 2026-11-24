@@ -933,6 +933,36 @@ def dtv_targets(args):
 DTV_CUDA_STREAM = 9
 
 
+def add_data_lag(out, cfg, args, spds):
+    """--data-lag-s: every GPU's voltage copy (run_send_voltage's cudaCopyToRingbuffer) holds
+    each frame until it is that old, and host_side_buffer_depth grows by the frames the lag
+    holds, so the input keeps its headroom."""
+    if not args.data_lag_s:
+        return
+    if args.data_lag_s < 0:
+        raise SystemExit("--data-lag-s %g: must be >= 0" % args.data_lag_s)
+    fe = cfg["fengine"]
+    frame_s = spds * fe["fft_length"] / (float(fe["sampling_rate_MHz"]) * 1e6)
+    for gpu, proc in sorted(out.get("run_send_voltage", {}).items()):
+        if not isinstance(proc, dict):
+            continue
+        copies = [
+            c for c in proc["commands"] if c.get("name") == "cudaCopyToRingbuffer"
+        ]
+        if len(copies) != 1:
+            raise SystemExit(
+                f"--data-lag-s: run_send_voltage/{gpu} has {len(copies)} "
+                "cudaCopyToRingbuffer commands, expected one"
+            )
+        copies[0]["data_lag_s"] = float(args.data_lag_s)
+    extra = int(math.ceil(args.data_lag_s / frame_s))
+    out["host_side_buffer_depth"] = "%s + %d" % (out["host_side_buffer_depth"], extra)
+    sys.stderr.write(
+        "  data lag %.3f s: +%d frames of %.2f ms on every host_side_buffer_depth buffer\n"
+        % (args.data_lag_s, extra, 1e3 * frame_s)
+    )
+
+
 def add_dtv_subtract(out, cfg, args, node, spds):
     """cudaDtvSubtract (lib/cuda/cudaDtvSubtract.cpp) after cudaCopyToRingbuffer in
     run_send_voltage on every GPU holding one of --dtv-subtract-freq-ids: the lagged subtraction
@@ -1481,6 +1511,13 @@ def build_n2dual_branch(cfg, node, gpu, chan_idx, freq_ids, args, spds, chain=No
                     # shares one REST server, so a shared path would apply one chain's trims to
                     # another chain's PRNs.
                     "set_trim_endpoint": f"/{pre}inject/set_trim",
+                    # Streamed data symbols (gnssTrackChain.hpp), for the chains named.
+                    **(
+                        {"set_nav_symbols_endpoint": f"/{pre}inject/set_nav_symbols"}
+                        if chain
+                        and chain["signal"] in (args.nav_symbols or "").split(",")
+                        else {}
+                    ),
                     "trim_ttl_s": TRIM_TTL_S,
                     # A pinned F-engine epoch (the node file's frame0_utc, or --frame0-nano)
                     # overrides the telescope's GPS time0 as the record epoch. Records are
@@ -1932,7 +1969,11 @@ INJECT_ROW_KEYS = (
     "get_prns_endpoint",
     "set_prns_endpoint",
 )
-INJECT_ROW_OPTIONAL_KEYS = ("prn_freq_offset_hz", "trim_endpoint")
+INJECT_ROW_OPTIONAL_KEYS = (
+    "prn_freq_offset_hz",
+    "trim_endpoint",
+    "set_nav_symbols_endpoint",
+)
 
 
 def inject_host_form(injects, gpu):
@@ -4234,6 +4275,24 @@ def main():
         help="frames of slack between the lane-dump gate and its writer (default %(default)s)",
     )
     ap.add_argument(
+        "--data-lag-s",
+        type=float,
+        default=0.0,
+        metavar="S",
+        help="hold every voltage frame until it is S seconds old before the GPUs see it "
+        "(cudaCopyToRingbuffer data_lag_s), so streamed data symbols (--nav-symbols) arrive "
+        "first; host-side buffers grow by the frames held. Every node at once: the fleet "
+        "trim waits one window for a late node. Default 0 (off)",
+    )
+    ap.add_argument(
+        "--nav-symbols",
+        default="",
+        metavar="DESC[,DESC]",
+        help="the extra-signal chains (descriptor names, e.g. GPS_L2C_CM,BDS_B2B_I) that "
+        "take data symbols streamed from another receiver on <chain>inject/set_nav_symbols "
+        "(gnssTrackChain.hpp). Their brokers need --dr-nav-symbols. Default none",
+    )
+    ap.add_argument(
         "--proj-mean",
         action="store_true",
         help="record the mean projector: GnssN2Project's basis record into N2Accumulate, which "
@@ -5246,6 +5305,7 @@ def main():
         )
         out.update(blocks)
     add_dtv_subtract(out, cfg, args, args.node, out.get("samples_per_data_set", 8192))
+    add_data_lag(out, cfg, args, out.get("samples_per_data_set", 8192))
 
     # The header is the provenance, complete enough to regenerate from: the argv and a hash of
     # the base. The generator and config/chord_gnss_node.yaml are inputs too, deliberately not
