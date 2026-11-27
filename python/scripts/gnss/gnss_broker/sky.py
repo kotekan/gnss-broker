@@ -20,6 +20,65 @@ _SKY_REFRESH_S = 900.0
 _SKY_BRIDGE_REFRESH_S = 60.0
 _SKY_RETRY_S = 600.0
 
+# How far from its toe a GPS, Galileo or BeiDou record may predict the sky brdc_predict serves
+# (hints, visibility, the bias solve), so a receiver offline or powered off for months still
+# hints its search from the cache, as long as it has not moved: against fresh records at L5
+# (11-23), 1-15 days old the Doppler is off by 0.1-2 Hz median and 76 Hz at most, the elevation
+# by 0.4 deg at most; 4 months old, by 8-57 Hz median and 270 Hz at most, inside the narrowed
+# search's 500 Hz. The dead-reckoned code model keeps best_eph's 4 h window: the range is
+# already ~100 m off at a day. GLONASS and SBAS records keep theirs too.
+HINT_MAX_AGE_S = 120 * 86400.0
+
+
+def lists_constellation(state, sysc, t_utc):
+    """Whether the BRDC store `state` lists sysc's satellites, every one in orbit: a BRDC
+    record within HINT_MAX_AGE_S, or the decoders' almanacs (state["almanac"]). The decoded
+    orbits and the GuoWang relay hold only the satellites they were read from."""
+    import decoded_eph
+
+    t = decoded_eph.gpst_of_utc(t_utc)
+    for (s, _), recs in (state.get("eph") or {}).items():
+        if s == sysc and recs and abs(t - recs[-1]["toe_gpst"]) <= HINT_MAX_AGE_S:
+            return True
+    alm = state.get("almanac")
+    return alm is not None and bool(alm.entries(t, sys=sysc))
+
+
+def _with_decoded(readers, pa, pb, lat, lon, alt_m, t_utc, sysc, dt):
+    """Put in predict_all's rows pa (at t_utc) and pb (dt later) the rows of the decoded_eph
+    Readers given (the receiver's decoded ephemerides, then the almanacs its decoders read),
+    those with a clock (the hint's sat_clk_s), for the satellites whose BRDC record is missing
+    or past best_eph's 4 h. Each such satellite takes the source whose reference time is
+    nearest, the BRDC's or a reader's, the earlier reader on a tie: fresh BRDC first, then
+    whichever of the decoded orbits, the almanacs and stale BRDC is the least old. A reader's
+    issue weeks old predicts as well as a BRDC record as old; an almanac at its t_oa, to a few
+    Hz and km. Nothing is evaluated while the BRDC is fresh for every satellite the readers
+    hold, the usual case."""
+    import decoded_eph
+
+    t = decoded_eph.gpst_of_utc(t_utc)
+    ents = [r.entries(t, sys=sysc) if r is not None else [] for r in readers]
+    best = {}  # (sys, prn) -> (age of the nearest reference time, reader index)
+    for i, es in enumerate(ents):
+        for e in es:
+            k = (e[0], e[1])
+            if k not in best:
+                brdc_age = abs(pa[k]["toe_age_s"]) if k in pa else float("inf")
+                best[k] = (brdc_age, None) if brdc_age > 14400.0 else (0.0, None)
+            if abs(t - e[5]) < best[k][0]:
+                best[k] = (abs(t - e[5]), i)
+    for i, es in enumerate(ents):
+        sel = [e for e in es if best[(e[0], e[1])][1] == i]
+        if not sel:
+            continue
+        for rows, t_at in ((pa, t_utc), (pb, t_utc + timedelta(seconds=dt))):
+            got = decoded_eph.predict_from_decoders(
+                sel, lat, lon, alt_m, t_at, mask_deg=-90.0, max_age=HINT_MAX_AGE_S
+            )
+            for k, v in got.items():
+                if v["sat_clk_s"] is not None:
+                    rows[k] = v
+
 
 def brdc_predict(
     state, lat, lon, alt_m, sysc, min_prn, t_utc, f_carrier_hz, fdma_df=None
@@ -80,9 +139,18 @@ def brdc_predict(
             lock.release()
     eph = state["eph"]
     dt = 4.0
+    age = HINT_MAX_AGE_S if sysc in ("G", "E", "C") else 14400.0
     # Only sysc's rows are read below, so only sysc is predicted.
     pa = ge.predict_all(
-        eph, lat, lon, alt_m, t_utc, mask_deg=-90.0, health_gate=False, sysc=sysc
+        eph,
+        lat,
+        lon,
+        alt_m,
+        t_utc,
+        mask_deg=-90.0,
+        max_age=age,
+        health_gate=False,
+        sysc=sysc,
     )
     pb = ge.predict_all(
         eph,
@@ -91,9 +159,17 @@ def brdc_predict(
         alt_m,
         t_utc + timedelta(seconds=dt),
         mask_deg=-90.0,
+        max_age=age,
         health_gate=False,
         sysc=sysc,
     )
+    # The receiver's own decoded orbits and the almanacs its decoders read (state["decoded"]
+    # and state["almanac"], decoded_eph.Readers over the ephemeris cache) where the BRDC is
+    # stale or has nothing: a box offline longer than its BRDC cache, or never online, hints
+    # from what it decoded.
+    readers = [state.get("decoded"), state.get("almanac")]
+    if sysc in ("G", "E", "C", "R") and any(r is not None for r in readers):
+        _with_decoded(readers, pa, pb, lat, lon, alt_m, t_utc, sysc, dt)
     C = C_LIGHT
     out = {}
     for (s, prn), v in pa.items():

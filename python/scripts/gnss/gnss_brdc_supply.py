@@ -16,6 +16,7 @@ here knows about orbits. Code that needs best_eph or predict_all belongs in gnss
 Mutable module state lives here (LOG_HOOK, _src_dead, _HOURLY_STATIONS): read and write it
 through this module by name.
 """
+import glob
 import json
 import os
 import re
@@ -244,6 +245,22 @@ def _hourly_target_met(seen):
 # appends to the broker log (StandardError=inherit). A thin merge must be logged: downstream it
 # is invisible until a constellation's prediction collapses.
 LOG_HOOK = None
+
+# Nav files appended, last, to every fetch_brdc result in this process: pointing records for
+# satellites no broadcast product carries (gnss_oddsat_pointing.py, TLE-derived). Set only by
+# the broker's --extra-nav (set_extra_nav); empty everywhere else, so no other reader of the
+# BRDC store sees them. Last means any broadcast record wins a same-toe tie.
+EXTRA_NAV = []
+
+
+def set_extra_nav(patterns):
+    """Make fetch_brdc append the files these paths or glob patterns name when it is called, so a
+    daily file is picked up on the day it appears."""
+    EXTRA_NAV[:] = [p for p in patterns if p]
+
+
+def _with_extra(paths):
+    return list(paths) + [f for pat in EXTRA_NAV for f in sorted(glob.glob(pat))]
 
 
 def _log_hourly(msg):
@@ -710,7 +727,9 @@ _REFRESH = {"thread": None, "lock": threading.Lock()}
 def _cached_sources(when, cache_dir):
     """The cached files fetch_brdc hands out without touching the network: the daily variants
     on disk for `when`'s day (the previous day's only when this day has none, as in
-    _fetch_brdc_merged), then the station-hourly merge. [] when nothing is cached.
+    _fetch_brdc_merged), then the station-hourly merge. With neither, the newest daily of any
+    day: after days offline it still predicts the sky the search hints from
+    (sky.HINT_MAX_AGE_S). [] when nothing is cached.
     parse_rinex_nav merges per PRN by toe, so the order only breaks identical-toe ties."""
     out = []
     for back in (0, 1):
@@ -728,6 +747,16 @@ def _cached_sources(when, cache_dir):
     hourly = os.path.join(cache_dir, "hourly_MN.rnx.gz")
     if os.path.exists(hourly):
         out.append(hourly)
+    if not out and os.path.isdir(cache_dir):
+        days = [
+            f
+            for f in os.listdir(cache_dir)
+            if f.startswith("BRDC00WRD_") and f.endswith("_01D_MN.rnx.gz")
+        ]
+        if days:
+            # The newest day (YYYYDOY at [12:19]), its S variant before its R.
+            newest = max(days, key=lambda f: (f[12:19], f[10] == "S"))
+            out.append(os.path.join(cache_dir, newest))
     return out
 
 
@@ -794,14 +823,14 @@ def fetch_brdc(when=None, cache_dir=CACHE, block=False):
 
     The ordering and merging contract is documented on _fetch_brdc_now."""
     if os.environ.get("GNSS_BRDC_DIR") or block:
-        return _fetch_brdc_now(when, cache_dir)
+        return _with_extra(_fetch_brdc_now(when, cache_dir))
     when = when or datetime.now(timezone.utc)
     cache_dir = _offline_cache_dir(when, cache_dir)
     have = _cached_sources(when, cache_dir)
     if not have:
-        return _fetch_brdc_now(when, cache_dir)
+        return _with_extra(_fetch_brdc_now(when, cache_dir))
     _refresh_in_background(when, cache_dir)
-    return have
+    return _with_extra(have)
 
 
 def _fetch_brdc_now(when=None, cache_dir=CACHE):

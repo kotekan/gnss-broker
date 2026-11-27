@@ -313,6 +313,35 @@ def test_flag_and_mapping():
     )
 
 
+def test_no_feed():
+    """--joint-no-feed: main's joint_shadow assignment, as written, runs the joint solve for
+    any named consumer unless the flag is set; the default parses off."""
+    sets = [
+        n
+        for n in ast.walk(_main_tree())
+        if isinstance(n, ast.Assign)
+        and ast.unparse(n.targets[0]) == "args.joint_shadow"
+    ]
+    check(len(sets) == 1, "one args.joint_shadow assignment in main")
+    ap = cli.build_parser("x")
+    check(
+        not ap.parse_args(["--trackers", "t"]).joint_no_feed,
+        "--joint-no-feed defaults off",
+    )
+    for consume, no_feed, want in (
+        (set(), False, False),
+        ({"clk", "rate"}, False, True),
+        ({"clk", "rate"}, True, False),
+    ):
+        a = types.SimpleNamespace(joint_no_feed=no_feed)
+        _run_nodes(sets[:1], {"joint_consume": consume, "args": a})
+        check(
+            a.joint_shadow == want,
+            "consume %s, no-feed %s -> joint solve %s"
+            % (sorted(consume), no_feed, want),
+        )
+
+
 def test_unit_per_state():
     """joint_unit names a state: the two moduli can differ (each shortens to its own callers'
     shortest code), and the trk consumer must convert in TRK_STATE's."""
@@ -480,6 +509,33 @@ def test_trk_consumers_read_trk():
     )
 
 
+def test_trk_slew_keeps_long_period():
+    """--dr-clock-long places the clock whole code periods beyond clk_now. A seed slewed from
+    TRK_STATE keeps those periods, as the legacy offset does: the joint offset is only defined
+    within one code period."""
+    saved = deadreckon.dr_clock_long_chips
+    deadreckon.dr_clock_long_chips = lambda ctx: -L
+    try:
+        rx = make_rx("fed")
+        jt = rx._joint[TRK_STATE]
+        bsat = {3: 0.37, 9: -0.21}
+        offs, clk_now, _l, _ = run_dr_seed(rx, "trk", bsat)
+    finally:
+        deadreckon.dr_clock_long_chips = saved
+    w3 = (
+        clk_now + rx.joint_clk_delta(jt.predicted(("G", 3)), REF, L, clk_now, REF, L)[0]
+    )
+    check(
+        offs.get(3) == (MODEL + w3 - L) % MOD - MODEL,
+        "PRN 3 (slewed from TRK_STATE) keeps the clock's -1 period (got %r, want %r)"
+        % (offs.get(3), (MODEL + w3 - L) % MOD - MODEL),
+    )
+    check(
+        offs.get(9) == (MODEL + clk_now - L + bsat[9]) % MOD - MODEL,
+        "PRN 9 (legacy offset) keeps it too (got %r)" % offs.get(9),
+    )
+
+
 def test_trk_slew_bound_falls_back():
     """A TRK offset beyond joint_slew_max_chips of the clock is refused per satellite and the
     seed takes the legacy offset, b_sat included, exactly as on the search path."""
@@ -594,6 +650,43 @@ def test_trk_unfit_falls_back_or_coasts():
         and "REFUSED (bounds" in jc[0],
         "a once-fed TRK state (n 4, sigma %.2f): the clk consumer's sigma bound refuses it (%s)"
         % (jt.sigma(), jc[:1]),
+    )
+
+
+def test_trk_coast_refuses_a_stepped_clock():
+    """A coast may not move the clock further than an adoption may. After the legacy clock
+    steps (a declared re-pin once the capture re-based), the last adopted joint clock is
+    hundreds of chips away, and coasting on it would hold every seed on the old
+    clock."""
+    bsat = {3: 0.37, 9: -0.21}
+    ds = {
+        "jclk_t": T_NOW - 60.0,
+        "jclk_last": 750.8,
+        "jclk_last_t": T_NOW - 60.0,
+        "jclk_last_rate": 0.001,
+    }
+    offs, clk_now, lines, _ = run_dr_seed(
+        make_rx("empty", search="thin"),
+        "trk",
+        bsat,
+        ds=dict(ds),
+        argkw={"joint_clk_coast_bound": True},
+    )
+    jc = _lines(lines, "JOINT-CLK")
+    check(
+        clk_now == LEGACY_CLK
+        and not any("COAST" in m for m in jc)
+        and all(offs[p] == _w(LEGACY_CLK + bsat[p]) for p in (3, 9)),
+        "--joint-clk-coast-bound, an adoption 600 chips from the legacy clock: no coast, "
+        "the legacy clock (%s)" % (jc[:1],),
+    )
+    _, clk_now, lines, _ = run_dr_seed(
+        make_rx("empty", search="thin"), "trk", bsat, ds=dict(ds)
+    )
+    jc = _lines(lines, "JOINT-CLK")
+    check(
+        clk_now != LEGACY_CLK and any("COAST" in m for m in jc),
+        "without it the refusal coasts on the last adoption (%s)" % (jc[:1],),
     )
 
 

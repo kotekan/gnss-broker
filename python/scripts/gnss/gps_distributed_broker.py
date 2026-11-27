@@ -33,6 +33,7 @@ Runs one chain; scripts/gnss/broker_multi.py runs every chain of
 config/gnss_chains_chord.yaml as threads of one process.
 """
 
+import json
 import math
 import os
 import statistics
@@ -152,6 +153,10 @@ def main(argv=None, rx=None, publisher=None):
             return
     ap = build_parser(__doc__)
     args = ap.parse_args(argv)
+    if args.extra_nav:
+        import gnss_brdc_supply
+
+        gnss_brdc_supply.set_extra_nav(args.extra_nav.split(","))
     # Frozen tuning (cli._FROZEN): constants, set as args attributes so use sites read them
     # like flags; no command line can change them.
     for _k, _v in _FROZEN.items():
@@ -294,9 +299,10 @@ def main(argv=None, rx=None, publisher=None):
     )
     band_id = "%.2fMHz" % (args.carrier_hz / 1e6)
     # The joint solve (dr_joint_shadow) runs whenever a --joint-consume consumer is named;
-    # without it the consumer would read a state nothing feeds.
+    # without it the consumer would read a state nothing feeds. --joint-no-feed: the consumers
+    # read the state the other chains feed, and this chain's detections stay out of it.
     joint_consume = parse_joint_consume(args.joint_consume)
-    args.joint_shadow = bool(joint_consume)
+    args.joint_shadow = bool(joint_consume) and not args.joint_no_feed
     # Which joint state those consumers read (--joint-source; #191 step 3): said once, here.
     if joint_consume or args.joint_source != "search":
         _log(
@@ -409,7 +415,7 @@ def main(argv=None, rx=None, publisher=None):
     _tg = _telem.parse_endpoint(
         telem_gather_endpoint(args.telem_gather, args.transcript_read)
     )
-    telem_client = _telem.shared_client(*_tg) if _tg else None
+    telem_client = _telem.shared_client(*_tg, depth=args.telem_depth) if _tg else None
     _gcpace.start_once(args.gc_interval_s)
     telem_chain = log_tag() or (args.signal or "")
     if telem_client is not None:
@@ -567,6 +573,34 @@ def main(argv=None, rx=None, publisher=None):
                 )
         except Exception as e:
             _log("BRDC almanac unavailable (%s); falling back to TLE" % e)
+        # The receiver's own decoded orbits (--decoded-eph-file, the ephemeris cache), and the
+        # almanacs its decoders read there, fill the sky where the BRDC has nothing
+        # (sky.brdc_predict). With no BRDC at all but this constellation in the cache, hint from
+        # the cache, not the TLEs (which need the network too); the store's refresh still loads
+        # BRDC when it comes.
+        if args.decoded_eph_file:
+            import decoded_eph as _dec_mod
+
+            _reader = _dec_mod.Reader(args.decoded_eph_file.split(","))
+            _alm_reader = _dec_mod.Reader(
+                args.decoded_eph_file.split(","), almanac=True
+            )
+            _g_now = _dec_mod.gpst_of_utc(_alm_now())
+            if brdc_alm is None and (
+                _reader.entries(_g_now, sys=alm_sys)
+                or _alm_reader.entries(_g_now, sys=alm_sys)
+            ):
+                brdc_alm = rx.brdc(
+                    ("brdc", _alm_now().strftime("%Y-%j")),
+                    lambda: {"mod": _alm_eph_mod, "eph": {}, "eph_t": _now()},
+                )
+                _log(
+                    "almanac: no BRDC for %s; hinting from the cache (decoded orbits, almanacs)"
+                    % alm_sys
+                )
+            if brdc_alm is not None:
+                brdc_alm.setdefault("decoded", _reader)
+                brdc_alm.setdefault("almanac", _alm_reader)
     if args.almanac and brdc_alm is None:
         try:
             from gps_beamtrack import load_gps_satellites
@@ -578,8 +612,34 @@ def main(argv=None, rx=None, publisher=None):
                 % (len(almanac_sats), args.lat, args.lon)
             )
         except Exception as e:
-            _log("almanac unavailable (%s); falling back to search Doppler" % e)
-            args.almanac = False
+            if (
+                args.warm_search_prns
+                and args.decoded_eph_file
+                and alm_sys in ("G", "E", "C", "R")
+            ):
+                # No orbit source at all (a box with no network and nothing cached): rather
+                # than turn the hints off for good, start from an empty store, which the cache
+                # fills and the store's refresh loads BRDC into when it comes, and warm-search
+                # the rest (searchhint).
+                import gnss_ephemeris as _alm_eph_mod
+                import decoded_eph as _dec_mod
+
+                brdc_alm = rx.brdc(
+                    ("brdc", _alm_now().strftime("%Y-%j")),
+                    lambda: {"mod": _alm_eph_mod, "eph": {}, "eph_t": _now()},
+                )
+                for _k, _alm in (("decoded", False), ("almanac", True)):
+                    brdc_alm.setdefault(
+                        _k,
+                        _dec_mod.Reader(args.decoded_eph_file.split(","), almanac=_alm),
+                    )
+                _log(
+                    "almanac unavailable (%s); no orbits for %s: hinting from the cache as "
+                    "it fills, warm-searching the rest" % (e, alm_sys)
+                )
+            else:
+                _log("almanac unavailable (%s); falling back to search Doppler" % e)
+                args.almanac = False
     # Every GuoWang satellite's passes near the boresight, for the transit sky: one store per
     # table, shared by every chain like the BRDC one.
     gw_transits = (
@@ -1265,9 +1325,18 @@ def main(argv=None, rx=None, publisher=None):
             from gps_nav_decode import sv_position_lnav as _svp_lnav
             from beidou_bcnav1 import sv_position_bcnav1 as _svp_bc1
             from beidou_bcnav2 import sv_position_bcnav2 as _svp_bc2
+            from glonass_nav_predictor import sv_position_glo as _svp_glo
         except Exception as e:
             _log("decoded-eph fallback DISABLED (import: %s)" % e)
             _decfb = None
+    # GuoWang's relay propagator comes with guowang_csk, which needs scipy: a broker without it
+    # skips the relay's ephemerides rather than the whole fallback.
+    _svp_relay = None
+    if _decfb:
+        try:
+            from guowang_csk import sv_position_relay as _svp_relay
+        except Exception as e:
+            _log("decoded-eph fallback: no GuoWang relay ephemerides (import: %s)" % e)
     _dec_reg = (
         [
             ("GPS_L1_LNAV", "G", _svp_lnav, "toe", lambda: _nav.navbits)
@@ -1294,15 +1363,79 @@ def main(argv=None, rx=None, publisher=None):
     )
     _dec_reg = [r for r in _dec_reg if r]
 
+    # nav_decode.py's decoded ephemerides (--decoded-eph-file), by signal: the propagator each
+    # one's eph takes. B-CNAV3 has none here, so B2b's are skipped. GuoWang's relay
+    # (guowang_csk.py --eph-out) stands behind the rest (decoded_eph.LAST_RESORT).
+    _dec_svp = (
+        {
+            "GPS_L1_LNAV": _svp_lnav,
+            "GPS_L2C_CNAV": _svp_cnav,
+            "GPS_L5_CNAV": _svp_cnav,
+            "GAL_E1B_INAV": _svp_inav,
+            "GAL_E5BI_INAV": _svp_inav,
+            "GAL_E5AI_FNAV": _svp_fnav,
+            "BDS_B1C_BCNAV1": _svp_bc1,
+            "BDS_B2A_BCNAV2": _svp_bc2,
+            "GW_CSK_RELAY": _svp_relay,
+            "GLO_L2OF": _svp_glo,
+        }
+        if _decfb
+        else {}
+    )
+    _dec_files = {}  # path -> (mtime_ns, its entries)
+
+    def _file_entries():
+        """(sys, prn, signal, eph, sv_pos, toe_field, toe_gpst or None) from each
+        --decoded-eph-file, a directory (an ephemeris cache) standing for its *.json, each file
+        re-read when its mtime changes. A file that cannot be read keeps its entries."""
+        out = []
+        named = filter(None, (args.decoded_eph_file or "").split(","))
+        for path in _decfb.expand(named):
+            try:
+                mt = os.stat(path).st_mtime_ns
+                if path not in _dec_files or _dec_files[path][0] != mt:
+                    with open(path) as fh:
+                        doc = json.load(fh)
+                    ents = []
+                    for r in doc.get("eph", []):
+                        svp = _dec_svp.get(r.get("signal"))
+                        if svp is not None:
+                            ents.append(
+                                (
+                                    r["sys"],
+                                    int(r["prn"]),
+                                    r["signal"],
+                                    r["eph"],
+                                    svp,
+                                    r["toe_field"],
+                                    r.get("toe_gpst"),
+                                )
+                            )
+                    _dec_files[path] = (mt, ents)
+            except Exception as e:
+                _log_rl("decfile", "decoded-eph-file %s unreadable: %s" % (path, e))
+            out.extend(_dec_files.get(path, (None, []))[1])
+        return out
+
     def _decoded_entries(t_utc):
         """Build decoded_eph entries (sys, prn, signal, eph, sv_pos, toe_gpst) from whichever
-        decoders exist. toe_gpst is the eph's time-of-week field as GPST, placed within half a
-        week of t_utc (decoded_eph.toe_gpst_near), the epoch the caller evaluates at
-        (deadreckon.dr_eph_epoch). Never raises: a bad decoder or eph is skipped."""
+        decoders exist, this broker's own and those in --decoded-eph-file. toe_gpst is the eph's
+        time-of-week field as GPST: a cache entry's own (placed from the sky's week when it was
+        decoded), else within half a week of t_utc (decoded_eph.toe_gpst_near), the epoch the
+        caller evaluates at (deadreckon.dr_eph_epoch). Never raises: a bad decoder or eph is
+        skipped."""
         ents = []
         if not _decfb:
             return ents
         gpst_now = _decfb.gpst_of_utc(datetime.fromtimestamp(t_utc, tz=timezone.utc))
+        for gsys, prn, signal, e, svp, toef, toe_gpst in _file_entries():
+            try:
+                if toef in e:
+                    if toe_gpst is None:
+                        toe_gpst = _decfb.toe_gpst_near(gsys, e[toef], gpst_now)
+                    ents.append((gsys, prn, signal, e, svp, toe_gpst))
+            except Exception:
+                continue
         for signal, gsys, svp, toef, getter in _dec_reg:
             try:
                 dec = getter()
@@ -1471,6 +1604,7 @@ def main(argv=None, rx=None, publisher=None):
 
     # The first cycle's clock: ctx.uptime_s counts from it, on the cycle clock (context.py).
     t_first = None
+    site_seq = rx.site_req["seq"]  # the newest live site move this chain has adopted
     while True:
         # Sample the frozen cycle clock once (transport._Transcript): every _now() in this pass
         # returns t0, so every gate, age and EMA evaluates at one instant rather than across
@@ -1479,6 +1613,17 @@ def main(argv=None, rx=None, publisher=None):
         if t_first is None:
             t_first = t0
         _ctx.begin_cycle(t0=t0, uptime_s=t0 - t_first)
+        # A live site move (publish /set_site): adopt the receiver-wide target, once each.
+        if rx.site_req["seq"] != site_seq:
+            site_seq = rx.site_req["seq"]
+            _tgt = rx.site_target(site_seq, args.lat, args.lon, args.alt)
+            if _tgt is not None:
+                args.lat, args.lon, args.alt = _tgt
+                _log(
+                    "SITE MOVED live by E %+.2f N %+.2f U %+.2f m (/set_site #%d): the model "
+                    "predicts from there from this cycle"
+                    % (rx.site_req["d_enu"] + (site_seq,))
+                )
         t_wall = time.time()  # real clock, for the pass's busy time and the sleep
         # 1. collect best-SNR detection per PRN across all detection sources
         best = {}  # prn -> (snr, dop, cp, ref_hop, nh, cp_long, cp_at_ref)
@@ -1760,7 +1905,9 @@ def main(argv=None, rx=None, publisher=None):
             if _ctx.utc0_sample0:
                 _axis_utc0[0] = float(_ctx.utc0_sample0)
             if _axis_utc0[0] > 0.0 and _fh > 0.0:
-                _fh_bound = (_now() - _axis_utc0[0] + 0.05) * args.hops_per_sec
+                _fh_bound = (
+                    _now() - _axis_utc0[0] + args.fe_axis_future_s
+                ) * args.hops_per_sec
                 if _fh > _fh_bound:
                     _fh_ok = max(
                         (
@@ -1836,11 +1983,11 @@ def main(argv=None, rx=None, publisher=None):
                 # rejects stale samples by construction, but it adopts any upward move under
                 # 2.0 s at once and decays only 1.8 s/hour, so one future sample would hold the
                 # axis ahead for hours and evaluate every model off-time. Staleness is >= 0, so
-                # the offset can never exceed -utc0_sample0 (+0.05 s): reject such a sample from
-                # the init, the ratchet and the snap counter. The ingestion bound above already
-                # enforces the same limit.
+                # the offset can never exceed -utc0_sample0 (+fe_axis_future_s): reject such a
+                # sample from the init, the ratchet and the snap counter. The ingestion bound
+                # above already enforces the same limit.
                 _utc0 = float(getattr(_ctx, "utc0_sample0", 0.0) or 0.0)
-                if _utc0 > 0.0 and _oi > -_utc0 + 0.05:
+                if _utc0 > 0.0 and _oi > -_utc0 + args.fe_axis_future_s:
                     _log_rl(
                         "fe-axis-future",
                         "fe-axis: REJECTED a pow_hop %.2f s in the FUTURE of the wall "

@@ -3,6 +3,7 @@
     python3 -m unittest gnss_broker.test_timebase
 """
 import random
+import types
 import unittest
 
 from gnss_broker import timebase
@@ -108,6 +109,49 @@ class TimeBaseTests(unittest.TestCase):
             timebase.VERDICT.suspect,
             "3 satellites cannot separate a shift from scatter",
         )
+
+    def test_only_a_broadcast_ephemeris_chain_votes(self):
+        rates = sky(8)
+        rng = random.Random(7)
+        best = {i: (50.0, rng.gauss(0.0, 400.0)) for i in range(8)}
+        pred = {i: (0.0, a) for i, a in enumerate(rates)}
+        real_now, real_det = timebase.now_utc_s, timebase.DETECTOR
+        timebase.now_utc_s = lambda ctx: 1000.0
+        try:
+            for alm_sys, src, votes, no_vote in (
+                ("W", "brdc", False, False),
+                ("G", "tle", False, False),
+                ("G", "brdc", True, False),
+                ("R", "brdc", True, False),
+                ("R", "brdc", False, True),
+            ):
+                timebase.VERDICT.clear()
+                timebase.DETECTOR = timebase.TimeBaseDetector()
+                ctx = types.SimpleNamespace(
+                    alm_sys=alm_sys,
+                    args=types.SimpleNamespace(
+                        almanac_source=src,
+                        bias_min_snr=0.0,
+                        bias_det_fresh_s=30.0,
+                        no_timebase_vote=no_vote,
+                    ),
+                    best=best,
+                    pred=pred,
+                    det_fresh={i: (None, 1000.0) for i in range(8)},
+                    t0=1000.0,
+                    chain_id="c",
+                    unhealthy=set(),
+                )
+                for _ in range(5):
+                    timebase.observe(ctx, lambda *a, **k: None)
+                self.assertEqual(
+                    timebase.VERDICT.suspect,
+                    votes,
+                    "a 400 Hz spread on a %s chain from %s, no-vote %s"
+                    % (alm_sys, src, no_vote),
+                )
+        finally:
+            timebase.now_utc_s, timebase.DETECTOR = real_now, real_det
 
     def test_verdict_is_shared_across_chains(self):
         rates = sky(8)

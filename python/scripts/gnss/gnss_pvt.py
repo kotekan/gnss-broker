@@ -1,7 +1,8 @@
 """Single-point position (PVT self-survey) from the code observable.
 
 The obs logs carry a per-satellite `code_resid_m` (measured code range minus the model range
-predicted at the configured position) and `az`/`el`. That residual is a linearized
+predicted at the configured position; rows written before 2026-11-21 carry the opposite sign,
+see code_resid_meas_m) and `az`/`el`. That residual is a linearized
 single-point-position observation about the configured position:
 
     code_resid_i  ~=  -e_i . dx  +  c*dt_group  +  (iono_i + multipath_i + noise_i)
@@ -18,13 +19,28 @@ is self-consistent.
 Pure geometry; no network, no broker state. Solve per group and a combined best-fit.
 """
 
+import glob
+import json
 import math
+import os
+import statistics
 
 import numpy as np
 
 C_LIGHT = 299792458.0
 WGS84_A = 6378137.0
 WGS84_E2 = 6.69437999014e-3
+# The obs rows' code_resid_m has been measured minus model range since 2026-11-21, marked by
+# code_resid_sign; rows without the marker were written as model minus measured.
+CODE_RESID_SIGN = "meas-model"
+
+
+def code_resid_meas_m(r):
+    """An obs-log row's code residual as measured minus model range (m), or None."""
+    c = r.get("code_resid_m")
+    if c is None:
+        return None
+    return float(c) if r.get("code_resid_sign") == CODE_RESID_SIGN else -float(c)
 
 
 def _llh_to_ecef(lat, lon, alt):
@@ -174,14 +190,16 @@ def _dops(Ninv3):
 def hatch_smooth(rows, window_s, wrap_m=None):
     """Carrier-smoothed code residual for one satellite-band: (resid_m, n, sd_m, method).
 
-    Hatch filtering, in its simplest exact form. Within one carrier arc the code residual and
-    the carrier residual differ by a constant (the arc's ambiguity) plus what the carrier does
-    not see: code noise, code multipath, and twice the ionosphere (the code-carrier
-    divergence, slow). So the mean of (code - carrier) over a window is a low-noise estimate
-    of that constant, and carrier_now + that mean is the code range with the carrier's noise
-    and the code's absoluteness. Carrier phase must never be averaged across an arc break (the
-    constant changes there), so only rows on the newest row's carrier arc (`carr_arc`, else
-    `adr_arc`) enter.
+    Hatch filtering. Within one carrier arc the code residual and the carrier residual differ
+    by a constant (the arc's ambiguity) plus what the carrier does not see: code noise, code
+    multipath, twice the ionosphere (the code-carrier divergence, slow), and on a receiver
+    whose LO is offset from its sample clock that offset times the wavelength, a steady drift
+    (the bladeRF: ~0.3 Hz, ~0.08 m/s). So a line fitted to (code - carrier) over the window and
+    evaluated at the newest row is a low-noise estimate of that difference now, and
+    carrier_now + it is the code range with the carrier's noise and the code's absoluteness. A
+    mean would lag the drift by half the window. Carrier phase must never be smoothed across an
+    arc break (the constant changes there), so only rows on the newest row's carrier arc and
+    source (`carr_arc` and `carr_resid_src`, else `adr_arc`) enter.
 
     `rows` are obs-log dicts (t, code_resid_m, carr_resid_m, carr_arc or adr_arc) for one
     (sys, prn, band); the newest row is the epoch reported. `wrap_m` is the code period in
@@ -193,7 +211,7 @@ def hatch_smooth(rows, window_s, wrap_m=None):
         (
             r
             for r in rows
-            if r.get("code_resid_m") is not None and r.get("t") is not None
+            if code_resid_meas_m(r) is not None and r.get("t") is not None
         ),
         key=lambda r: r["t"],
     )
@@ -202,16 +220,17 @@ def hatch_smooth(rows, window_s, wrap_m=None):
     new = rows[-1]
 
     def _arc(r):
-        # the arc the carrier residual lives on (carr_arc), falling back to the ADR's
+        # the arc the carrier residual lives on (carr_arc), falling back to the ADR's, and its
+        # source: an adr and an fadr arc can share a number
         a = r.get("carr_arc")
-        return a if a is not None else r.get("adr_arc")
+        return (r.get("carr_resid_src"), a if a is not None else r.get("adr_arc"))
 
     t_new, arc = new["t"], _arc(new)
     sel = [r for r in rows if r["t"] >= t_new - window_s and _arc(r) == arc]
-    c_new = float(new["code_resid_m"])
+    c_new = code_resid_meas_m(new)
 
     def _code(r):
-        c = float(r["code_resid_m"])
+        c = code_resid_meas_m(r)
         return c - wrap_m * round((c - c_new) / wrap_m) if wrap_m else c
 
     if len(sel) < 2:
@@ -232,9 +251,28 @@ def hatch_smooth(rows, window_s, wrap_m=None):
     )
     if carr_ok:
         d = [ci - float(r["carr_resid_m"]) for ci, r in zip(c, sel)]
-        m_h, sd_h = _msd(d)
-        if sd_h < sd_box:
-            return float(new["carr_resid_m"]) + m_h, len(d), sd_h, "hatch"
+        n = len(d)
+        if n < 3:
+            m_h, sd_h = _msd(d)
+            res = sd_h
+        else:
+            # Least-squares line through (t, d), evaluated at the newest row. Whether the
+            # carrier helps is judged on the line's residual scatter against the code's; the
+            # sd returned is per row, as the boxcar's is (solve divides by sqrt(n)): the
+            # endpoint's standard error times sqrt(n), about twice that scatter.
+            ts = [r["t"] - t_new for r in sel]
+            mt, md = sum(ts) / n, sum(d) / n
+            sxx = sum((x - mt) ** 2 for x in ts)
+            slope = (
+                sum((x - mt) * (y - md) for x, y in zip(ts, d)) / sxx if sxx else 0.0
+            )
+            m_h = md - slope * mt
+            res = math.sqrt(
+                sum((y - md - slope * (x - mt)) ** 2 for x, y in zip(ts, d)) / (n - 2)
+            )
+            sd_h = res * math.sqrt(n * (1.0 / n + (mt * mt / sxx if sxx else 0.0)))
+        if res < sd_box:
+            return float(new["carr_resid_m"]) + m_h, n, sd_h, "hatch"
     return m_box, len(c), sd_box, "boxcar"
 
 
@@ -350,3 +388,356 @@ def solve(
     out["combined"] = _combined([g for g in all_groups if not g.endswith("-IF")])
     out["combined_if"] = _combined([g for g in all_groups if g.endswith("-IF")])
     return out
+
+
+def measurements_from_obs(globs, max_age_s, t_now, smooth_s=90.0):
+    """Per-(sys, prn, chain) code observation across the obs logs, for the PVT self-survey:
+    the freshest row's epoch, carrier-smoothed over the last `smooth_s` seconds of its own
+    arc (hatch_smooth). One row per satellite-chain. Residuals are wrapped,
+    clock-dominated ranges, de-wrapped per group to the group median so the common clock is
+    a single free parameter and no satellite straddles a code-period edge. Returns a list of
+    {group, sys, prn, az, el, resid_m, t, f_hz} (the newest row's epoch and carrier), plus n,
+    sd_m and method where smoothing succeeded.
+
+    The group is the obs row's band, i.e. the chain: one chain, one clock.
+    """
+    t_floor = t_now - max(max_age_s, smooth_s) - 5.0
+    hist = {}  # (sys, prn, band) -> rows inside the smoothing window
+    latest = {}  # (sys, prn, band) -> (t, group, az, el, resid_m, L_m, carrier_hz)
+    for pat in globs:
+        for path in glob.glob(pat):
+            try:
+                # A file last written before the window holds no row inside it: the glob
+                # matches every past day's log, and each tail-read costs up to 4 MB.
+                if os.path.getmtime(path) < t_floor:
+                    continue
+                size = os.path.getsize(path)
+                with open(path) as f:
+                    # tail: the smoothing window of every satellite on this chain. Rows are
+                    # ~1.2 kB and a chain logs ~13 rows/s, so 4 MB holds several minutes.
+                    f.seek(max(0, size - 4 * 1024 * 1024))
+                    f.readline()
+                    for line in f:
+                        # cheap epoch pre-filter before the JSON decode: rows start {"t":...
+                        if line.startswith('{"t":'):
+                            try:
+                                if float(line[5 : line.index(",", 5)]) < t_floor:
+                                    continue
+                            except Exception:
+                                pass
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        t = d.get("t")
+                        sysid, prn, fr = d.get("sys"), d.get("prn"), d.get("band")
+                        res, az, el = d.get("code_resid_m"), d.get("az"), d.get("el")
+                        if (
+                            t is None
+                            or sysid is None
+                            or prn is None
+                            or fr is None
+                            or res is None
+                            or az is None
+                            or el is None
+                        ):
+                            continue
+                        if t < t_floor:
+                            continue
+                        # a replica that is not on its signal (a noise probe, or not
+                        # fleet_present) has a code phase but no range
+                        if d.get("noise_probe") or d.get("fleet_present") is False:
+                            continue
+                        key = (sysid, prn, fr)
+                        hist.setdefault(key, []).append(d)
+                        if t_now - t > max_age_s:
+                            continue
+                        if key in latest and latest[key][0] >= t:
+                            continue
+                        cl, ch = d.get("code_len"), d.get("chip_rate_hz")
+                        L = (cl / ch * C_LIGHT) if (cl and ch) else None
+                        latest[key] = (
+                            t,
+                            fr,
+                            az,
+                            el,
+                            float(res),
+                            L,
+                            d.get("carrier_hz"),
+                        )
+            except Exception:
+                continue
+    # Carrier-smooth each satellite's code residual over its own arc (hatch_smooth):
+    # the code observable is white at ~0.1-0.25 chips per record, while the carrier holds arcs
+    # for hours.
+    extra = {}
+    for key, v in list(latest.items()):
+        hs = hatch_smooth(hist.get(key, []), smooth_s, wrap_m=v[5])
+        if hs is None:
+            continue
+        r_s, n, sd, method = hs
+        latest[key] = (v[0], v[1], v[2], v[3], float(r_s), v[5], v[6])
+        extra[key] = {"n": n, "sd_m": sd, "method": method}
+        # The code discriminator over the window: a replica not yet on its signal (minutes
+        # after a broker start) reads its range short.
+        discs = [abs(r["dll_disc"]) for r in hist[key] if r.get("dll_disc") is not None]
+        if discs:
+            extra[key]["disc_chips"] = statistics.median(discs)
+
+    # de-wrap each group's residuals to the group median (handles the clock straddling a
+    # code-period boundary; L is the code period in metres).
+    by_group = {}
+    for (sysid, prn, fr), v in latest.items():
+        by_group.setdefault(v[1], []).append((sysid, prn, fr, v))
+    out = []
+    for group, rows in by_group.items():
+        med = statistics.median([r[3][4] for r in rows])
+        for sysid, prn, fr, v in rows:
+            t_m, g, az, el, res, L, f_hz = v
+            if L:
+                res = res - L * round(
+                    (res - med) / L
+                )  # unwrap to within +-L/2 of the median
+            m = {
+                "group": g,
+                "sys": sysid,
+                "prn": prn,
+                "az": az,
+                "el": el,
+                "resid_m": res,
+                "t": t_m,
+                "f_hz": f_hz,
+            }
+            m.update(extra.get((sysid, prn, fr), {}))
+            out.append(m)
+    return out
+
+
+def _seek_rows(f, t0, margin_s=60.0):
+    """Leave binary file f, rows appended in time order each starting '{"t":', at a line start
+    no later than the first row at t0 - margin_s (the writers' rows interleave by seconds), by
+    bisecting on byte offsets: a day's log is gigabytes and a window its last minutes.
+    """
+    lo, hi = 0, os.fstat(f.fileno()).st_size
+    while hi - lo > 1 << 16:
+        mid = (lo + hi) // 2
+        f.seek(mid)
+        f.readline()
+        line = f.readline()
+        try:
+            t = float(line[5 : line.index(b",", 5)])
+        except ValueError:
+            t = None
+        if not line.startswith(b'{"t":') or t is None or t >= t0 - margin_s:
+            hi = mid
+        else:
+            lo = mid
+    f.seek(lo)
+    if lo:
+        f.readline()
+
+
+def rows_from_obs(globs, t0, t1, sysid, every_s=10.0):
+    """Every code observation of one constellation in [t0, t1] from the obs logs, one per
+    satellite per every_s (the rows are smoothed and correlated over seconds): a list of
+    {group, sys, prn, az, el, resid_m, t}, oldest first. The residuals are wrapped,
+    clock-dominated ranges; each is de-wrapped to within half a code period of the median of
+    the 20 before it, so the receiver clock stays continuous across the window."""
+    rows, last = [], {}
+    tag = ('"sys":"%s"' % sysid).encode()
+    for pat in globs:
+        for path in glob.glob(pat):
+            try:
+                if os.path.getmtime(path) < t0:
+                    continue
+                with open(path, "rb") as f:
+                    _seek_rows(f, t0)
+                    for line in f:
+                        if line.startswith(b'{"t":'):
+                            try:
+                                t = float(line[5 : line.index(b",", 5)])
+                                if t < t0:
+                                    continue
+                                if t > t1 + 60.0:
+                                    break
+                                if t > t1:
+                                    continue
+                            except ValueError:
+                                pass
+                        if (
+                            tag not in line[:120]
+                            and tag.replace(b":", b": ") not in line[:120]
+                        ):
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except ValueError:
+                            continue
+                        t, res = d.get("t"), d.get("code_resid_m")
+                        if d.get("sys") != sysid or t is None or res is None:
+                            continue
+                        if (
+                            not (t0 <= t <= t1)
+                            or d.get("az") is None
+                            or d.get("el") is None
+                        ):
+                            continue
+                        if d.get("noise_probe") or d.get("fleet_present") is False:
+                            continue
+                        key = (d.get("prn"), d.get("band"))
+                        if t - last.get(key, -1e18) < every_s:
+                            continue
+                        last[key] = t
+                        cl, ch = d.get("code_len"), d.get("chip_rate_hz")
+                        rows.append(
+                            {
+                                "group": d.get("band"),
+                                "sys": sysid,
+                                "prn": d.get("prn"),
+                                "az": d["az"],
+                                "el": d["el"],
+                                "resid_m": float(res),
+                                "t": t,
+                                "L": (cl / ch * C_LIGHT) if (cl and ch) else None,
+                            }
+                        )
+            except OSError:
+                continue
+    rows.sort(key=lambda r: r["t"])
+    ref = []
+    for r in rows:
+        L = r.pop("L")
+        if ref and L:
+            med = statistics.median(ref[-20:])
+            r["resid_m"] -= L * round((r["resid_m"] - med) / L)
+        ref.append(r["resid_m"])
+    return rows
+
+
+def _batch_fit(H, y, keep, reject_k):
+    """batch_solve's fit over the rows in `keep`, dropping rows whose post-fit residual exceeds
+    max(60 m, reject_k x the median) until none does: (x, post over every row, Ninv, keep) or
+    None when under 8 rows remain or the geometry is singular."""
+    keep = keep.copy()
+    for _ in range(10):
+        if keep.sum() < 8:
+            return None
+        Hk, yk = H[keep], y[keep]
+        try:
+            Ninv = np.linalg.inv(Hk.T @ Hk)
+        except np.linalg.LinAlgError:
+            return None
+        x = Ninv @ (Hk.T @ yk)
+        post = y - H @ x
+        thr = max(60.0, reject_k * float(np.median(np.abs(post[keep]))))
+        bad = keep & (np.abs(post) > thr)
+        if not bad.any():
+            break
+        keep &= ~bad
+    return x, post, Ninv, keep
+
+
+def batch_solve(rows, lat0, lon0, alt0, min_el_deg=10.0, sigma_m=5.0, reject_k=5.0):
+    """A stationary receiver's position from code observations spread over a window, for a
+    constellation too sparse to solve at one epoch (GuoWang). rows: {t, prn, az, el, resid_m}.
+    The model is resid = -los . dx + c0 + c1 (t - t_mid): one receiver clock offset and rate over
+    the window, which a disciplined oscillator holds, so the directions a low satellite sweeps
+    through in minutes stand in for simultaneous satellites. A satellite whose broadcast clock is
+    off sits at one offset through its pass, and a few satellites' fit absorbs much of it, which
+    also inflates the median the row cut scales with. So with 3 or more satellites, each is first
+    tested against the fit of the others: the one whose median residual there exceeds
+    max(60 m, reject_k x that fit's median, reject_k x the error of its prediction) by the largest
+    factor is excluded, and the test repeats. Then rows whose post-fit residual exceeds max(60 m, reject_k x the median) are
+    dropped and the fit repeated. Valid only for a receiver that did not move over the window;
+    the caller must check that. Returns solve's result fields plus n_rows, n_sats, span_s,
+    clock_rate_m_s and excluded ({prn: median residual m against the others}), or None when the
+    window cannot determine the position (under 2 satellites or 120 s, no redundancy, or a
+    degenerate geometry)."""
+    use = [r for r in rows if r.get("el") is not None and r["el"] >= min_el_deg]
+    if len(use) < 8 or len({r.get("prn") for r in use}) < 2:
+        return None
+    ts = np.array([r["t"] for r in use], dtype=float)
+    span = float(ts.max() - ts.min())
+    if span < 120.0:
+        return None
+    t_mid = 0.5 * (ts.max() + ts.min())
+    H = np.zeros((len(use), 5))
+    y = np.zeros(len(use))
+    for i, r in enumerate(use):
+        H[i, 0:3] = -_los_enu(r["az"], r["el"])
+        H[i, 3] = 1.0
+        H[i, 4] = r["t"] - t_mid
+        y[i] = r["resid_m"]
+    prn = np.array([r.get("prn") for r in use])
+    keep = np.ones(len(use), dtype=bool)
+    excluded = {}
+    while len(set(prn[keep].tolist())) >= 3:
+        worst = None
+        for s in sorted(set(prn[keep].tolist())):
+            f = _batch_fit(H, y, keep & (prn != s), reject_k)
+            if f is None or math.sqrt(max(0.0, float(np.trace(f[2][0:3, 0:3])))) > 30.0:
+                continue
+            x, post, Ninv, k = f
+            med = float(np.median(np.abs(post[k])))
+            # the others' fit predicts this satellite only as well as their geometry allows:
+            # its prediction error, with rows counted as in the reported errors below
+            Hs = H[prn == s]
+            corr = math.sqrt(max(1.0, k.sum() / (3.0 * len(set(prn[k])))))
+            pred = (
+                math.sqrt(float(np.median(np.einsum("ij,jk,ik->i", Hs, Ninv, Hs))))
+                * med
+                * corr
+            )
+            off = float(np.median(post[prn == s]))
+            ratio = abs(off) / max(60.0, reject_k * med, reject_k * pred)
+            if ratio > 1.0 and (worst is None or ratio > worst[0]):
+                worst = (ratio, s, off)
+        if worst is None:
+            break
+        excluded[worst[1]] = round(worst[2], 1)
+        keep &= prn != worst[1]
+    f = _batch_fit(H, y, keep, reject_k)
+    if f is None:
+        return None
+    x, post, Ninv, kept = f
+    n_rejected = int((keep & ~kept).sum())
+    keep = kept
+    dof = max(1, int(keep.sum()) - 5)
+    pk = post[keep]
+    rms = math.sqrt(float(pk @ pk) / dof)
+    sigma0 = rms / sigma_m
+    # The rows are not independent (smoothed, and one satellite's error persists through its
+    # pass), so the formal error is scaled by the rows per satellite: a pass counts as a few
+    # measurements, not as many as it has rows.
+    n_sats = len({use[i].get("prn") for i in np.nonzero(keep)[0]})
+    corr = math.sqrt(max(1.0, keep.sum() / max(1, 3 * n_sats)))
+    cov = (max(1.0, sigma0) * sigma_m * corr) ** 2 * Ninv
+    pd = math.sqrt(max(0.0, float(np.trace(Ninv[0:3, 0:3]))))
+    if pd > 30.0:
+        return None
+    sd = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    apr = _llh_to_ecef(lat0, lon0, alt0)
+    pos = apr + _enu_axes(lat0, lon0).T @ x[0:3]
+    lat, lon, alt = _ecef_to_llh(pos)
+    return dict(
+        n_sats=n_sats,
+        n_rejected=n_rejected,
+        excluded=excluded,
+        n_rows=int(keep.sum()),
+        span_s=span,
+        lat=lat,
+        lon=lon,
+        alt=alt,
+        ecef=pos.tolist(),
+        d_e=float(x[0]),
+        d_n=float(x[1]),
+        d_u=float(x[2]),
+        clock_m=float(x[3]),
+        clock_rate_m_s=float(x[4]),
+        resid_rms_m=rms,
+        sigma0=sigma0,
+        sigma_e=float(sd[0]),
+        sigma_n=float(sd[1]),
+        sigma_u=float(sd[2]),
+        **_dops(Ninv[0:3, 0:3])
+    )

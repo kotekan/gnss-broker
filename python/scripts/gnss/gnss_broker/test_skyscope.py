@@ -1113,6 +1113,228 @@ def test_fetch_brdc_off_the_loop():
             os.environ["GNSS_BRDC_DIR"] = pin
 
 
+def test_hint_sky_outlives_the_seed_window():
+    """The hint sky takes GPS, Galileo and BeiDou records up to HINT_MAX_AGE_S from their toe,
+    so a receiver offline for days still hints its search from the cache; GLONASS and SBAS keep
+    the 4 h window that cuts them to their own (predict_all)."""
+    from gnss_broker import sky
+
+    print("\nbrdc_predict: the hint sky reads stale G/E/C records, not R or S")
+    ages = {}
+
+    class _AgeMod(_FakeEphMod):
+        def predict_all(self, eph, lat, lon, alt, t, mask_deg=0.0, **kw):
+            ages[kw.get("sysc")] = kw.get("max_age")
+            return dict(self.visible)
+
+    ge = _AgeMod()
+    state = {"mod": ge, "eph": {"x": 1}, "eph_t": time.time()}
+    for sysc in "GECRS":
+        _predict(state, ge, sysc, 1, [1, 2, 3])
+    check(
+        all(ages[c] == sky.HINT_MAX_AGE_S for c in "GEC"),
+        "G, E and C predict within %.0f days" % (sky.HINT_MAX_AGE_S / 86400.0),
+    )
+    check(ages["R"] == 14400.0 and ages["S"] == 14400.0, "R and S keep 4 h")
+
+
+def test_cache_falls_back_to_the_newest_daily():
+    """With neither this day's nor yesterday's daily nor the hourly merge on disk (days
+    offline), fetch_brdc hands out the newest cached daily, S before R, without a fetch."""
+    import gnss_brdc_supply as sup
+    from datetime import datetime, timezone
+
+    print("\n_cached_sources: days offline, the newest daily on disk")
+    when = datetime(2026, 11, 24, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as d:
+        check(sup._cached_sources(when, d) == [], "an empty cache hands out nothing")
+        for n in (
+            "BRDC00WRD_S_20262220000_01D_MN.rnx.gz",
+            "BRDC00WRD_R_20263200000_01D_MN.rnx.gz",
+            "BRDC00WRD_S_20263200000_01D_MN.rnx.gz",
+        ):
+            open(os.path.join(d, n), "wb").close()
+        got = [os.path.basename(x) for x in sup._cached_sources(when, d)]
+        check(
+            got == ["BRDC00WRD_S_20263200000_01D_MN.rnx.gz"],
+            "the newest day's S variant (%s)" % got,
+        )
+        open(os.path.join(d, "hourly_MN.rnx.gz"), "wb").close()
+        got = [os.path.basename(x) for x in sup._cached_sources(when, d)]
+        check(got == ["hourly_MN.rnx.gz"], "the hourly merge, when there, as before")
+    check(sup._cached_sources(when, "/nonexistent/cache") == [], "no cache directory")
+
+
+def test_decoded_orbits_before_stale_brdc():
+    """The hint sky takes, per satellite, a fresh BRDC record (within 4 h), else the source
+    nearest its reference time of the receiver's decoded issues, its almanacs and the stale
+    BRDC (the BRDC on a tie, then the decoded issue); a decoded issue with no clock is never
+    used."""
+    import decoded_eph
+    from gnss_broker import sky
+
+    print("\nbrdc_predict: fresh BRDC, then the nearest of the others")
+    day = 86400.0
+    ge = _FakeEphMod()
+    ge.visible = {
+        ("G", p): dict(
+            az=0.0,
+            el=10.0,
+            range_m=2.0e7,
+            range_rate_mps=0.0,
+            sat_clk_s=0.0,
+            toe_age_s=age,
+        )
+        for p, age in ((1, 0.0), (2, 30 * day), (3, 30 * day))
+    }
+    # PRN -> the decoded issue's age (PRN 5's has no clock), and the almanac's
+    dec = {1: 3600.0, 2: day, 3: 60 * day, 4: 10 * day, 5: day}
+    alm = {1: 3600.0, 2: day, 3: 2 * day, 4: 20 * day, 6: 3 * day}
+
+    class _Reader(object):
+        def __init__(self, ages, signal):
+            self.ages, self.signal = ages, signal
+
+        def entries(self, gpst_now, sys=None):
+            return [
+                ("G", p, self.signal, {}, None, gpst_now - a)
+                for p, a in self.ages.items()
+            ]
+
+    def _stub(ents, lat, lon, alt, t, **kw):
+        return {
+            (e[0], e[1]): dict(
+                az=0.0,
+                el=10.0,
+                range_m=2.0e7,
+                range_rate_mps=-2000.0 if e[2] == "ALM" else -1000.0,
+                sat_clk_s=None if e[1] == 5 and e[2] != "ALM" else 0.0,
+                toe_age_s=0.0,
+            )
+            for e in ents
+        }
+
+    real = decoded_eph.predict_from_decoders
+    decoded_eph.predict_from_decoders = _stub
+    try:
+        from datetime import datetime, timezone
+
+        state = {
+            "mod": ge,
+            "eph": {"x": 1},
+            "eph_t": time.time(),
+            "decoded": _Reader(dec, "GPS_L5_CNAV"),
+            "almanac": _Reader(alm, "ALM"),
+        }
+        out = sky.brdc_predict(
+            state, 49.32, -119.62, 545.0, "G", 1, datetime.now(timezone.utc), 1176.45e6
+        )
+    finally:
+        decoded_eph.predict_from_decoders = real
+    names = {0: "brdc", 1: "decoded", 2: "almanac"}
+    src = {p: names[int(round(v[0] / 3924.0))] for p, v in out.items()}
+    want = {1: "brdc", 2: "decoded", 3: "almanac", 4: "decoded", 6: "almanac"}
+    check(
+        src == want,
+        "fresh BRDC kept; stale BRDC beaten by a nearer decoded issue or almanac; the decoded "
+        "issue on a tie; missing satellites filled; no clock no row (%s)" % src,
+    )
+
+
+def test_warm_search_only_while_unlisted():
+    """almanac._unpredicted: a chain warm-searches the PRNs no source predicts only while
+    neither a BRDC record within HINT_MAX_AGE_S nor the decoders' almanacs list its
+    constellation, and never a capability-excluded, predicted or probe PRN."""
+    import decoded_eph
+    from datetime import datetime, timezone
+    from types import SimpleNamespace as NS
+    from gnss_broker import almanac, sky
+
+    print("\nwarm search: only for a constellation nothing lists")
+    now = datetime(2026, 11, 24, tzinfo=timezone.utc)
+    t = decoded_eph.gpst_of_utc(now)
+
+    class _Alm(object):
+        def __init__(self, n):
+            self.n = n
+
+        def entries(self, gpst_now, sys=None):
+            return [("E", 1, "GAL_ALM", {}, None, gpst_now)] * self.n
+
+    def store(age_days, n_alm):
+        eph = {("E", 2): [{"toe_gpst": t - age_days * 86400.0}]} if age_days else {}
+        return {"eph": eph, "almanac": _Alm(n_alm)}
+
+    check(sky.lists_constellation(store(1, 0), "E", now), "a day-old BRDC lists it")
+    check(
+        not sky.lists_constellation(store(200, 0), "E", now),
+        "a 200-day-old one does not",
+    )
+    check(sky.lists_constellation(store(0, 3), "E", now), "the almanacs list it")
+    check(
+        not sky.lists_constellation(store(1, 0), "G", now),
+        "another system's BRDC does not",
+    )
+    ctx = NS(
+        args=NS(warm_search_prns=2),
+        alm_sys="E",
+        alm_min_prn=1,
+        brdc_alm=store(0, 0),
+        almanac_sats=None,
+        capable={p for p in range(1, 64) if p != 7},
+        pred={5: ()},
+        pred_dark={},
+        probe_set={30},
+    )
+    got = almanac._unpredicted(ctx, now)
+    check(
+        got == set(range(1, 37)) - {5, 7, 30},
+        "unlisted: the range less predicted, incapable and probe PRNs (%d)" % len(got),
+    )
+    ctx.brdc_alm = store(1, 0)
+    check(not almanac._unpredicted(ctx, now), "listed: none")
+    ctx.brdc_alm, ctx.almanac_sats = None, ["tle"]
+    check(not almanac._unpredicted(ctx, now), "on the TLEs: none")
+    ctx.brdc_alm, ctx.args.warm_search_prns = store(0, 0), 0
+    check(not almanac._unpredicted(ctx, now), "off: none")
+
+
+def test_fdma_channels_from_the_almanacs():
+    """almanac._refresh_fdma: an FDMA chain's missing carrier offsets come from the store's
+    BRDC records, else the newest almanac of the slot; an offset there already is
+    kept."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace as NS
+    from gnss_broker import almanac
+
+    print("\nFDMA channels: from BRDC records and almanacs when the files had none")
+    now = datetime(2026, 11, 24, tzinfo=timezone.utc)
+
+    class _Alm(object):
+        def entries(self, gpst_now, sys=None):
+            return [
+                ("R", 3, "GLO_ALM", {"k": 2}, None, 200.0),
+                ("R", 3, "GLO_ALM", {"k": 5}, None, 100.0),
+                ("R", 4, "GLO_ALM", {"k": 6}, None, 100.0),
+                ("R", 1, "GLO_ALM", {"k": -7}, None, 100.0),
+            ]
+
+    ctx = NS(
+        args=NS(fdma_df={1: 437500.0}, signal="glo_l2of"),
+        brdc_alm={"eph": {("R", 4): [{"k": -4}]}, "almanac": _Alm()},
+        fdma_t=0.0,
+        alm_now=lambda: now,
+    )
+    almanac._refresh_fdma(ctx)
+    check(
+        ctx.args.fdma_df == {1: 437500.0, 3: 2 * 437500.0, 4: -4 * 437500.0},
+        "kept R01, R03 the newest almanac's, R04 BRDC's (%s)" % ctx.args.fdma_df,
+    )
+    ctx.args.fdma_df.pop(3)
+    almanac._refresh_fdma(ctx)
+    check(3 not in ctx.args.fdma_df, "not again within FDMA_REFRESH_S")
+
+
 def main():
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if here not in sys.path:
@@ -1134,6 +1356,11 @@ def main():
     test_refresh_cadence_matches_the_product()
     test_current_day_daily_ttl()
     test_fetch_brdc_off_the_loop()
+    test_hint_sky_outlives_the_seed_window()
+    test_cache_falls_back_to_the_newest_daily()
+    test_decoded_orbits_before_stale_brdc()
+    test_warm_search_only_while_unlisted()
+    test_fdma_channels_from_the_almanacs()
     print("\n%s (%d check(s) failed)" % ("FAIL" if _fails else "PASS", len(_fails)))
     return 1 if _fails else 0
 

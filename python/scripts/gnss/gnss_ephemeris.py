@@ -31,6 +31,10 @@ from datetime import datetime, timezone
 C_LIGHT = 299792458.0
 GPS_UTC_LEAP = 18.0  # GPST - UTC, s; update at the next leap second
 BDT_GPST = -14.0  # BDT = GPST - 14 s
+# A nav file's header comment marking TLE-derived pointing records (gnss_oddsat_pointing.py),
+# and the clock sigma its records carry: unknown, so far more than any code period.
+POINTING_MARK = "NOT BROADCAST DATA"
+POINTING_CLK_SIGMA_S = 1e-3
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 
 # Gravitational parameter / earth rotation per constellation ICD (S: WGS84, the MT9 frame;
@@ -230,18 +234,24 @@ def glonass_freq_channels(paths=None):
                 i += 1
                 continue
             i += 4
-            if -7 <= k <= 6 and 1 <= slot <= 32:
+            if -7 <= k <= 8 and 1 <= slot <= 32:
                 out.setdefault(slot, k)  # first (best) source wins
     return out
 
 
 def _parse_rinex_nav_file(path):
-    """Parse one RINEX 3 mixed-nav file -> {(sys, prn): [eph dicts sorted by toe_gpst]}."""
+    """Parse one RINEX 3 mixed-nav file -> {(sys, prn): [eph dicts sorted by toe_gpst]}.
+
+    A file whose header comments carry POINTING_MARK (gnss_oddsat_pointing.py's TLE-derived
+    records) gives each record clk_sigma_s = POINTING_CLK_SIGMA_S: its clock is unknown, so
+    the broker seeds it from the search and keeps it out of its clock solves."""
     op = gzip.open if path.endswith(".gz") else open
     with op(path, "rt", errors="replace") as f:
         lines = f.readlines()
     i = 0
+    pointing = False
     while i < len(lines) and "END OF HEADER" not in lines[i]:
+        pointing |= POINTING_MARK in lines[i]
         i += 1
     i += 1
     out = {}
@@ -290,6 +300,8 @@ def _parse_rinex_nav_file(path):
         if sysc == "R":
             e = _glonass_record(prn, af, orb, toc_gpst + GPS_UTC_LEAP)
             if e is not None:
+                if pointing:
+                    e["clk_sigma_s"] = POINTING_CLK_SIGMA_S
                 out.setdefault((sysc, prn), []).append(e)
             continue
         if sysc == "J":
@@ -342,6 +354,8 @@ def _parse_rinex_nav_file(path):
             e["toe_gpst"] = e["week"] * 604800.0 + e["toe_sow"]
         else:
             e["toe_gpst"] = (e["week"] + 1356.0) * 604800.0 + e["toe_sow"] - BDT_GPST
+        if pointing:
+            e["clk_sigma_s"] = POINTING_CLK_SIGMA_S
         if e["sqrta"] > 1000.0:  # sanity: reject empty/garbled records
             out.setdefault((sysc, prn), []).append(e)
         # (NavIC records are skipped by the sysc filter.)
@@ -1083,8 +1097,10 @@ def predict_all(
         )
         if e["sys"] == "W":
             out[key]["range_acc_mps2"] = range_acc
-            # How well the table knows the clock (clk_s): a TLE record's library theta to
-            # microseconds, the sender's own broadcast bias to tens of nanoseconds.
+        # How well the record knows the clock: a GuoWang TLE record's library theta to
+        # microseconds, the sender's own broadcast bias to tens of nanoseconds, a pointing
+        # record (POINTING_MARK) not at all.
+        if e["sys"] == "W" or "clk_sigma_s" in e:
             out[key]["clk_sigma_s"] = float(e.get("clk_sigma_s", 0.0))
         if unhealthy:
             out[key]["unhealthy"] = True

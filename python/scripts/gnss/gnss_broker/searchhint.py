@@ -14,7 +14,45 @@ so the error sustains itself. See `clockbias.py`.
 
 from gnss_broker.transport import _post, _log, _log_rl, axis_now, now_utc_s
 from gnss_broker.clockhealth import dr_solve_healthy
-from gnss_broker.deadreckon import dr_can_seed
+from gnss_broker.deadreckon import dr_owns_unhinted
+
+# A PRN no orbit source predicts (ctx.unpredicted) is searched over the whole MEO Doppler range
+# about the clock bias: the range rate seen from the ground peaks near 930 m/s (GPS).
+WARM_RANGE_RATE_MPS = 950.0
+# How long each set of warm PRNs stays hinted: longer than a search pass, so each is scanned.
+WARM_DWELL_S = 10.0
+
+
+def _warm_hints(ctx, margin):
+    """(clears, hints) for the PRNs no orbit source predicts (--warm-search-prns). A seeded one
+    is hinted at its seed's Doppler with the usual margin. The others take turns,
+    --warm-search-prns at a time for WARM_DWELL_S each, over WARM_RANGE_RATE_MPS of Doppler
+    either side of the clock bias plus the margin. A PRN whose turn ends is cleared (margin -1),
+    or its hint would live out the search's hint_ttl_s beside the next ones."""
+    w = ctx.warm
+    seeded = sorted(p for p in ctx.unpredicted if p in ctx.seeds)
+    hints = [
+        dict(
+            prn=p,
+            doppler_hz=ctx.seeds[p].get("doppler_hz", ctx.cb.value),
+            margin_hz=margin,
+        )
+        for p in seeded
+    ]
+    rest = sorted(p for p in ctx.unpredicted if p not in ctx.seeds)
+    clears = []
+    if ctx.t0 - w["t"] >= WARM_DWELL_S:
+        old, i = w["cur"], w["i"] % max(len(rest), 1)
+        w["cur"] = (rest[i:] + rest[:i])[: ctx.args.warm_search_prns]
+        w["i"], w["t"] = i + ctx.args.warm_search_prns, ctx.t0
+        clears = [dict(prn=p, doppler_hz=0.0, margin_hz=-1.0) for p in old]
+    wide = margin + WARM_RANGE_RATE_MPS * ctx.args.carrier_hz / 299792458.0
+    hints += [
+        dict(prn=p, doppler_hz=ctx.cb.value, margin_hz=wide)
+        for p in w["cur"]
+        if p in rest
+    ]
+    return clears, hints
 
 
 def stage_narrow_search(ctx):
@@ -23,9 +61,11 @@ def stage_narrow_search(ctx):
 
     Doppler hints cover every up, capable PRN, with the narrow margin once the clock bias is
     solved and not stale and the wide margin otherwise (see the module docstring). With
-    --hint-skip-dr a PRN this chain can dead-reckon (deadreckon.dr_can_seed) gets none.
+    --hint-skip-dr a locked PRN this chain can dead-reckon gets none
+    (deadreckon.dr_owns_unhinted). With --warm-search-prns the PRNs no orbit source predicts
+    are hinted too (_warm_hints).
     """
-    if ctx.args.narrow_search and ctx.args.almanac and ctx.pred:
+    if ctx.args.narrow_search and ctx.args.almanac and (ctx.pred or ctx.unpredicted):
         margin = (
             ctx.args.search_margin_hz
             if ctx.cb.ema is not None and not ctx.cb.stale
@@ -37,13 +77,19 @@ def stage_narrow_search(ctx):
             if (ctx.up is None or p in ctx.up)
             and (ctx.capable is None or p in ctx.capable)
         ]
-        # --hint-skip-dr: the search is for satellites the model cannot seed. One left unhinted
-        # keeps its search seed while it holds lock and is dead-reckoned once that drops.
+        # --hint-skip-dr: the search is for satellites that are not locked or that the model
+        # cannot seed. The dead-reckon stage takes over the seed of one left unhinted.
         n_dr = 0
         if getattr(ctx.args, "hint_skip_dr", False):
-            kept = [h for h in hints if not dr_can_seed(ctx, h["prn"])]
+            kept = [h for h in hints if not dr_owns_unhinted(ctx, h["prn"])]
             n_dr = len(hints) - len(kept)
             hints = kept
+        # The clears go first: the search applies a list in order, so a PRN cleared from the
+        # warm turn and hinted otherwise in the same post keeps its hint.
+        n_pred = len(hints)
+        if ctx.unpredicted or ctx.warm["cur"]:
+            clears, warm = _warm_hints(ctx, margin)
+            hints = clears + hints + warm
         # NH alignment hint (--nh-hint). The acquire builds a full surface per overlay
         # alignment, so scanning all of them is most of a pass. nh is the overlay chip index
         # at transmit, so the ephemeris gives it outright (pred[3] is the range in m, pred[4]
@@ -199,9 +245,9 @@ def stage_narrow_search(ctx):
                     )
         _log_rl(
             "narrow",
-            "narrowed search: %d hints +-%d Hz (%s) -> %d/%d detectors%s"
+            "narrowed search: %d hints +-%d Hz (%s) -> %d/%d detectors%s%s"
             % (
-                len(hints),
+                n_pred,
                 int(margin),
                 (
                     "bias solved"
@@ -212,6 +258,12 @@ def stage_narrow_search(ctx):
                 ),
                 pushed,
                 len(ctx.detectors),
-                "; %d dead-reckoned, not hinted" % n_dr if n_dr else "",
+                "; %d locked and dead-reckoned, not hinted" % n_dr if n_dr else "",
+                (
+                    "; %d PRNs with no orbit, warm-searching %s"
+                    % (len(ctx.unpredicted), sorted(ctx.warm["cur"]))
+                    if ctx.unpredicted
+                    else ""
+                ),
             ),
         )

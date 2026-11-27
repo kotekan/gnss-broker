@@ -27,11 +27,31 @@ def rows(n, code_sd, arc=1, t0=0.0, slope=0.0, const=-4.6e12, wrap=False):
         code = truth(t) + slope * t + random.gauss(0.0, code_sd)
         if wrap:
             code += L_M * (i % 2)  # alternate rows one period apart
-        out.append({"t": t, "code_resid_m": code, "carr_resid_m": carr, "adr_arc": arc})
+        out.append(
+            {
+                "t": t,
+                "code_resid_m": code,
+                "code_resid_sign": gnss_pvt.CODE_RESID_SIGN,
+                "carr_resid_m": carr,
+                "adr_arc": arc,
+            }
+        )
     return out
 
 
 class T(unittest.TestCase):
+    def test_a_row_without_the_sign_marker_is_negated(self):
+        new = {"code_resid_m": 2.5, "code_resid_sign": gnss_pvt.CODE_RESID_SIGN}
+        self.assertEqual(gnss_pvt.code_resid_meas_m(new), 2.5)
+        self.assertEqual(gnss_pvt.code_resid_meas_m({"code_resid_m": 2.5}), -2.5)
+        self.assertIsNone(gnss_pvt.code_resid_meas_m({"code_resid_m": None}))
+        old = [dict(r, code_resid_m=-r["code_resid_m"]) for r in rows(90, code_sd=5.0)]
+        for r in old:
+            del r["code_resid_sign"]
+        self.assertEqual(
+            gnss_pvt.hatch_smooth(old, 90.0), gnss_pvt.hatch_smooth(rows(90, 5.0), 90.0)
+        )
+
     def test_smoothing_beats_the_single_row(self):
         r = rows(90, code_sd=5.0)
         val, n, sd, method = gnss_pvt.hatch_smooth(r, 90.0)
@@ -42,7 +62,27 @@ class T(unittest.TestCase):
         self.assertGreater(
             abs(r[-1]["code_resid_m"] - want) + 1e-9, abs(val - want) * 0.2
         )
-        self.assertAlmostEqual(sd, 5.0, delta=1.5)
+        # per row: the line's endpoint error times sqrt(n), about twice the code scatter
+        self.assertAlmostEqual(sd, 10.0, delta=3.0)
+
+    def test_a_steady_divergence_does_not_bias_the_newest_row(self):
+        """Code minus carrier drifting 0.08 m/s (the bladeRF's LO offset from its
+        sample clock): a mean lags by half the window, ~3.6 m; the line does not."""
+        r = rows(90, code_sd=1.0, slope=0.08)
+        val, n, sd, method = gnss_pvt.hatch_smooth(r, 90.0)
+        self.assertEqual(method, "hatch")
+        want = truth(r[-1]["t"]) + 0.08 * r[-1]["t"]
+        self.assertLess(abs(val - want), 0.6)
+
+    def test_an_adr_arc_and_an_fadr_arc_with_one_number_never_mix(self):
+        r = rows(60, code_sd=1.0)
+        for x in r[:30]:
+            x["carr_resid_src"], x["carr_arc"] = "adr", 1
+            x["carr_resid_m"] += 2.0e10
+        for x in r[30:]:
+            x["carr_resid_src"], x["carr_arc"] = "fadr", 1
+        val, n, sd, method = gnss_pvt.hatch_smooth(r, 90.0)
+        self.assertEqual((n, method), (30, "hatch"))
 
     def test_never_across_an_arc_break(self):
         a = rows(60, code_sd=0.1, arc=1, const=-4.6e12)

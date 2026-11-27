@@ -16,9 +16,11 @@ import statistics
 
 from gnss_broker import node_api
 from gnss_broker.transport import _now, _post, _log, _log_rl, axis_now_utc, now_utc_s
-from gnss_broker.sky import brdc_predict, nearest_boresight
+from gnss_broker.sky import brdc_predict, lists_constellation, nearest_boresight
+from gnss_broker import deadreckon
 from gnss_broker import timebase
 from gnss_broker import prnmap
+from gnss_broker import signals
 
 # The geometry post's cadence (--post-sat-geometry). A GNSS satellite takes many minutes to
 # cross the assemblers' 4-8 deg transit cones (elem_proj_deg, elem_sum_shared_freeze_deg, the
@@ -28,6 +30,34 @@ from gnss_broker import prnmap
 _POST_S = 30.0
 _LEO_POST_S = 1.5
 _LEO_NEAR_DEG = 10.0
+# How often an FDMA chain's missing carrier offsets are looked for (_refresh_fdma), s
+FDMA_REFRESH_S = 60.0
+# The PRNs a GPS, Galileo, BeiDou or GLONASS chain may warm-search (searchhint._warm_hints): each
+# constellation's range, BeiDou's GEO slots (1-5, 59-63) aside.
+_PRN_RANGE = {
+    "G": range(1, 33),
+    "E": range(1, 37),
+    "C": range(6, 59),
+    "R": range(1, 25),
+}
+
+
+def _unpredicted(ctx, t_pred):
+    """The PRNs of this chain no orbit source predicts (--warm-search-prns): none while the
+    BRDC, the decoders' almanacs or the TLEs list the constellation, since a PRN missing from
+    those is not in orbit; otherwise the range less the capability set's exclusions, the
+    predicted PRNs and the probes."""
+    if not getattr(ctx.args, "warm_search_prns", 0) or ctx.alm_sys not in _PRN_RANGE:
+        return set()
+    if ctx.brdc_alm is None:
+        if ctx.almanac_sats:
+            return set()
+    elif lists_constellation(ctx.brdc_alm, ctx.alm_sys, t_pred):
+        return set()
+    prns = {p for p in _PRN_RANGE[ctx.alm_sys] if p >= ctx.alm_min_prn}
+    if ctx.capable is not None:
+        prns &= ctx.capable
+    return prns - set(ctx.pred) - set(ctx.pred_dark or ()) - set(ctx.probe_set or ())
 
 
 def _refresh_capable(ctx):
@@ -61,6 +91,79 @@ def _refresh_capable(ctx):
     ctx.capable = new
 
 
+def _refresh_fdma(ctx):
+    """Every FDMA_REFRESH_S, fill an FDMA chain's missing carrier offsets (args.fdma_df) from the
+    store's BRDC records and the decoded almanacs, each GLONASS entry of which carries its
+    slot's k. At startup they come only from the BRDC files on disk, which a receiver with no
+    network may not have. A slot already there keeps its offset."""
+    df = getattr(ctx.args, "fdma_df", None)
+    if df is None or ctx.brdc_alm is None or _now() - ctx.fdma_t < FDMA_REFRESH_S:
+        return
+    ctx.fdma_t = _now()
+    ks = {}
+    rdr = ctx.brdc_alm.get("almanac")
+    if rdr is not None:
+        import decoded_eph
+
+        g = decoded_eph.gpst_of_utc(ctx.alm_now())
+        for e in sorted(rdr.entries(g, sys="R"), key=lambda e: e[5]):
+            if e[3].get("k") is not None:
+                ks[e[1]] = e[3]["k"]
+    for (sysc, prn), recs in ctx.brdc_alm["eph"].items():
+        for r in recs if sysc == "R" else ():
+            if r.get("k") is not None:
+                ks[prn] = r["k"]
+    new = {p: k * signals.FDMA_SPACING_HZ for p, k in ks.items() if p not in df}
+    if new:
+        df.update(new)
+        _log(
+            "signal %s: FDMA carrier offsets for %s from BRDC and the decoded almanacs"
+            % (ctx.args.signal, " ".join("R%02d" % p for p in sorted(new)))
+        )
+
+
+def adopt_freq_bias(ctx, adopt_fb):
+    """The clock-frequency bias of a chain that did not solve its own this cycle. Returns
+    True when it came from the joint state.
+
+    --freq-bias-joint: the joint state's clock rate (deadreckon.dr_joint_rate, under its
+    gates), scaled to this chain's carrier, as dr_drift scales it. It measures the same
+    oscillator from the trackers. Once every visible satellite is locked and dead-reckoned
+    the search detects nothing, no chain solves the bias, it goes stale (bias_stale_s) and
+    each unlocked satellite is searched over the wide margin. Otherwise, a free-running
+    oscillator (--dr-drift-source bias) or --freq-bias-adopt takes another chain's solved
+    bias, scaled to its own carrier."""
+    a = ctx.args
+    jla = None
+    if getattr(a, "freq_bias_joint", False):
+        jla = deadreckon.dr_joint_rate(ctx)
+    if jla is not None:
+        ctx.cb.ema = ctx.cb.value = jla * a.carrier_hz
+        ctx.cb.meas_t = ctx.t0
+        ctx.cb.update_seed(a.seed_bias_source)
+        _log_rl(
+            "clkbias-joint",
+            "clock-freq bias %+.2f Hz from the joint state's clock rate (%+.5f ppm)"
+            % (ctx.cb.ema, jla * 1e6),
+            every_s=60.0,
+        )
+        return True
+    if not adopt_fb and getattr(a, "dr_drift_source", "solve") != "bias":
+        return False
+    fb = ctx.rx.freq_bias(exclude=ctx.chain_id, t_now=ctx.t0)
+    if fb is not None:
+        ctx.cb.ema = ctx.cb.value = fb.value * a.carrier_hz
+        ctx.cb.meas_t = ctx.t0
+        ctx.cb.update_seed(a.seed_bias_source)
+        _log_rl(
+            "clkbias-adopt",
+            "clock-freq bias %+.1f Hz ADOPTED from '%s' (%d sats, %+.4f ppm)"
+            % (ctx.cb.ema, fb.src, fb.weight, fb.value * 1e6),
+            every_s=60.0,
+        )
+    return False
+
+
 def stage_almanac_predict(ctx):
     """2: orbit-predicted Doppler and visibility, and the receiver clock-bias EMA (--almanac).
         
@@ -75,6 +178,7 @@ def stage_almanac_predict(ctx):
     if ctx.args.almanac:
         try:
             _refresh_capable(ctx)
+            _refresh_fdma(ctx)
             raw_dark = {}
             # The epoch: the hop-axis now (#208). It is also what the time-base detector below
             # needs: a stale sample-0 epoch from the nodes moves this prediction, never the
@@ -220,6 +324,7 @@ def stage_almanac_predict(ctx):
         except Exception as e:
             _log("almanac predict failed: %s" % e)
         ctx.up = {p for p, v in ctx.pred.items() if v[2] >= ctx.args.mask_deg}
+        ctx.unpredicted = _unpredicted(ctx, axis_now_utc(ctx) or ctx.alm_now())
         # Common clock-frequency bias = median(measured - predicted) over detected
         # satellites. A tight residual spread confirms the sign convention; a spread with
         # resid ~ -2x predicted means doppler_sign (cli._FROZEN) is inverted.
@@ -358,26 +463,10 @@ def stage_almanac_predict(ctx):
                 ),
             )
         else:
-            # A free-running oscillator (--dr-drift-source bias): a chain that cannot solve the
-            # bias takes another chain's, scaled to its own carrier, as does a chain told to.
-            _fb = (
-                ctx.rx.freq_bias(exclude=ctx.chain_id, t_now=ctx.t0)
-                if _adopt_fb or getattr(ctx.args, "dr_drift_source", "solve") == "bias"
-                else None
-            )
-            if _fb is not None:
-                ctx.cb.ema = ctx.cb.value = _fb.value * ctx.args.carrier_hz
-                ctx.cb.meas_t = ctx.t0
-                ctx.cb.update_seed(ctx.args.seed_bias_source)
-                _log_rl(
-                    "clkbias-adopt",
-                    "clock-freq bias %+.1f Hz ADOPTED from '%s' (%d sats, %+.4f ppm)"
-                    % (ctx.cb.ema, _fb.src, _fb.weight, _fb.value * 1e6),
-                    every_s=60.0,
-                )
+            _joint = adopt_freq_bias(ctx, _adopt_fb)
             # Log both counts, so a held or unsolved bias reads as too few satellites rather
-            # than a clock or front-end fault. An adopted bias has its own line above.
-            if not _adopt_fb:
+            # than a clock or front-end fault. An adopted bias has its own line.
+            if not _adopt_fb and not _joint:
                 _log_rl(
                     "clkbias",
                     "clock-freq bias %s (%d sats < bias_min_sats %d: residual not "

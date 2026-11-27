@@ -58,6 +58,14 @@ from gnss_broker.gdvmap import GdvMap
 from gnss_broker.trkresid import wrap
 
 
+
+def _publish_dr_clock(ctx, *a, **kw):
+    """Contribute this chain's clock to the shared Receiver, unless --dr-clock-publish is off: a
+    chain whose solve carries a model bias of its own (the SBAS GEOs sit ~16 chips off their
+    BRDC model in common) must not become another band's bootstrap donor."""
+    if getattr(ctx.args, "dr_clock_publish", True):
+        ctx.rx.contribute_dr_clock(*a, **kw)
+
 def t_mod_code(t_s, lc_seg, code_len, chip_rate_hz):
     """t_s reduced modulo the code period lc_seg * code_len / chip_rate_hz, exactly.
 
@@ -395,7 +403,8 @@ def dr_clock_quality(ctx):
         # Carried with its code length and chip rate, because chips are modular and a unit: a
         # value mod 10230 says nothing about a 1023000-chip code, and a consumer at another
         # chip rate must convert it as a time.
-        ctx.rx.contribute_dr_clock(
+        _publish_dr_clock(
+            ctx,
             ctx.chain_id,
             ctx.band_id,
             ctx.dr_state["clk"],
@@ -559,7 +568,8 @@ def dr_clock_hold(ctx):
     if ctx.dr_state.get("drift") is not None:
         ctx.dr_state["drift_t"] = ctx.drp.now_w
     ctx.dr_state.pop("raw_prev", None)
-    ctx.rx.contribute_dr_clock(
+    _publish_dr_clock(
+        ctx,
         ctx.chain_id,
         ctx.band_id,
         ctx.dr_state["clk"],
@@ -686,7 +696,8 @@ def _dr_clock_step_gate(ctx):
                 ctx.drp.now_w - _cand["t"],
             )
         )
-        ctx.rx.contribute_dr_clock(
+        _publish_dr_clock(
+            ctx,
             ctx.chain_id,
             ctx.band_id,
             ctx.dr_state["clk"],
@@ -1242,7 +1253,8 @@ def _joint_coast(ctx, ds, jrate, jlen):
     the refusal that calls for a coast is the moment the state's rate is least trusted (a
     thin set walks it), and an unbounded live rate over 300 s could move the seeds by 6x
     the adoption bound. The level is built in joint chips, then converted and wrapped
-    exactly as an adoption is (Receiver.joint_clk_delta)."""
+    exactly as an adoption is (Receiver.joint_clk_delta). None as well when the coasted
+    level is further from this chain's clock than joint_clk_max_chips."""
     if not (ctx.args.joint_clk_coast_max_s > 0.0):
         return None
     last, t_last, rate = (
@@ -1256,17 +1268,49 @@ def _joint_coast(ctx, ds, jrate, jlen):
     if not (0.0 <= age <= ctx.args.joint_clk_coast_max_s):
         return None
     ext = rate * age
-    if abs(ext) > ctx.args.joint_clk_max_chips:
+    # --joint-clk-primary: the clock is the tracker-fed one, so a coast is bounded by what the
+    # stamped rate can be (joint_max_rate_ppm), not by the adoption bound against a legacy
+    # clock it no longer answers to. A long coast (a transit) then follows the receiver's
+    # real drift rather than being declined part way.
+    primary = _jclk_primary(ctx)
+    if primary:
+        if abs(rate) > _jclk_rate_cap(ctx, jrate):
+            return None
+    elif abs(ext) > ctx.args.joint_clk_max_chips:
         return None
-    delta = ctx.rx.joint_clk_delta(
+    delta, delta_j = ctx.rx.joint_clk_delta(
         (last + ext) % jlen,
         jrate,
         jlen,
         ctx.drp.clk_now,
         ctx.args.chip_rate_hz,
         ctx.code_len,
-    )[0]
+    )
+    # --joint-clk-coast-bound: nor may the coast move the clock further than an adoption may.
+    # Past that the legacy clock has stepped under it (a declared re-pin after the capture
+    # re-based), and the coast would hold every seed on the clock from before the step. Under
+    # --joint-clk-primary an adoption has no such bound either.
+    if (
+        not primary
+        and getattr(ctx.args, "joint_clk_coast_bound", False)
+        and abs(delta_j) > ctx.args.joint_clk_max_chips
+    ):
+        return None
     return delta, ext, age, rate
+
+
+def _jclk_primary(ctx):
+    """--joint-clk-primary on a --joint-source trk chain: the tracker-fed joint clock is the
+    level, adopted without the bound against the legacy (search or sibling) clock."""
+    return bool(getattr(ctx.args, "joint_clk_primary", False)) and (
+        joint_which(ctx.args) == TRK_STATE
+    )
+
+
+def _jclk_rate_cap(ctx, jrate):
+    """The largest clock rate a primary coast runs on, joint chips per second:
+    joint_max_rate_ppm of the joint's chip rate, the bound the rate consumer uses."""
+    return float(getattr(ctx.args, "joint_max_rate_ppm", 0.01)) * 1e-6 * jrate
 
 
 def dr_joint_rate(ctx):
@@ -1291,6 +1335,28 @@ def dr_joint_rate(ctx):
     return la
 
 
+def dr_drift(ctx):
+    """The rate this chain runs its clock at, chips/s: the measured drift (dr_state), else
+    the f_chip*(l-a) model, except that --dr-drift-source bias takes the carrier bias (a
+    free-running oscillator's frequency error), and under --dr-drift-joint a chain that takes
+    both the joint clock and its rate (joint-consume clk,rate) takes the joint rate."""
+    drift = ctx.dr_state.get("drift")
+    bias = getattr(ctx.args, "dr_drift_source", "solve") == "bias"
+    if bias and ctx.cb.ema is not None:
+        drift = ctx.cb.ema * ctx.args.chip_rate_hz / ctx.args.carrier_hz
+    if (
+        getattr(ctx.args, "dr_drift_joint", False)
+        and "clk" in ctx.joint_consume
+        and "rate" in ctx.joint_consume
+    ):
+        jla = dr_joint_rate(ctx)
+        if jla is not None:
+            drift = ctx.args.chip_rate_hz * jla
+    if drift is None:
+        drift = ctx.args.chip_rate_hz * ctx.drp.la
+    return drift
+
+
 def dr_can_seed(ctx, prn):
     """Can this chain dead-reckon prn: its clock is fresh (_dr_clock_local_fresh) and the
     model's last prediction for prn carries a clock known to half a chip and is not marked
@@ -1307,6 +1373,28 @@ def dr_can_seed(ctx, prn):
         and prn not in ctx.dr_untrusted
         and v.get("clk_sigma_s", 0.0) * ctx.args.chip_rate_hz <= 0.5
     )
+
+
+def dr_owns_unhinted(ctx, prn):
+    """--hint-skip-dr: the search no longer hints prn and the model owns its seed, because it
+    is locked and the model can seed it (dr_can_seed). Locked is dr_seed's test: fleet q >=
+    lock_q or prompt power >= lock_prompt_hold x the noise probes'. A cycle with no fleet
+    reading keeps a satellite the model already owns: a gap in the data is not a lost lock,
+    and re-hinting it hands it back to the search. An unlocked satellite stays hinted, so the
+    search can find it and its detections keep the clock solves fresh. A chain on the
+    tracker-fed clock (joint-consume clk, --joint-source trk) hands nothing over while it reads
+    another state (joint_read's mode): until then its detections are its clock."""
+    if not getattr(ctx.args, "hint_skip_dr", False) or not dr_can_seed(ctx, prn):
+        return False
+    if "clk" in ctx.joint_consume and joint_which(ctx.args) == TRK_STATE:
+        if (ctx.dr_state.get("jsrc") or {}).get("mode") != "trk":
+            return False
+    q, p = ctx.hold.q.get(prn), ctx.hold.prev.get(prn)
+    if q is None and p is None:
+        return prn in ctx.dr_state["seeded"]
+    return (ctx.args.lock_q > 0.0 and (q or 0.0) >= ctx.args.lock_q) or (
+        p or 0.0
+    ) >= ctx.args.lock_prompt_hold
 
 
 def dr_joint_clk(ctx):
@@ -1361,11 +1449,37 @@ def dr_joint_clk(ctx):
     membership churn steps the delta while the joint stands still, and a hold on each of
     those would put the chain back on the churned clock the joint replaces. The receiver
     clock moves under 0.003 chips/s, so a walk never meets the guard and a real level change
-    is a discontinuity, followed one hold late."""
+    is a discontinuity, followed one hold late.
+
+    --joint-clk-primary (a --joint-source trk chain only, docs 6.3 step 4): the tracker-fed
+    clock is the level. It is adopted without the joint_clk_max_chips bound against the
+    legacy clock, which is the search median or a sibling's, the very clock the joint
+    replaces; the sigma bound, the step guard and the period check stand. While TRK_STATE is
+    stale or unfit, the chain coasts on its last adoption of it rather than reading the
+    search-fed state (#242: a transit withholds the feed for 13-23 min, where the search is
+    worst), and only once the coast window has closed does the search-fed state bootstrap it,
+    under the ordinary bounds."""
     # --joint-source: the state joint_read hands out (search-fed, tracker-fed, or the
     # search-fed one a trk chain falls back to), whose unit every conversion below must use;
     # the tag says which.
     _jrC, _which, _tag = joint_read(ctx)
+    _prim = _jclk_primary(ctx)
+    if _prim and _which != TRK_STATE:
+        # The tracker-fed state is stale or unfit: coast on its last adoption here.
+        _unitT = ctx.rx.joint_unit(TRK_STATE)
+        _cT = _joint_coast(ctx, ctx.dr_state, _unitT[0], _unitT[1]) if _unitT else None
+        if _cT is not None:
+            _log_rl(
+                "jclk",
+                "JOINT-CLK%s: legacy %.3f chips -> COAST (primary: the tracker-fed state is "
+                "stale or unfit; %+.3f joint chips over %.0f s at clk_rate %+.4f joint "
+                "chips/s)" % (_tag, ctx.drp.clk_now, _cT[1], _cT[2], _cT[3]),
+                every_s=30.0,
+            )
+            ctx.drp.clk_now = (ctx.drp.clk_now + _cT[0]) % ctx.code_len
+            return
+        # No coast left: the search-fed state bootstraps the chain, under the ordinary bounds.
+        _prim = False
     if _jrC is None or len(_jrC._idx) < ctx.args.joint_min_sats:
         # Not fit to consume: thin, deaf, or absent. A transit that thins the feeders below
         # joint_min_sats is the case the coast exists for, so coast here too, on the stamps
@@ -1405,9 +1519,8 @@ def dr_joint_clk(ctx):
     _jdC, _jdJ = ctx.rx.joint_clk_delta(
         _jrC.clk, _jrate, _jlen, ctx.drp.clk_now, ctx.args.chip_rate_hz, ctx.code_len
     )
-    _jokC = (
-        _jsigC <= ctx.args.joint_clk_max_sigma
-        and abs(_jdJ) <= ctx.args.joint_clk_max_chips
+    _jokC = _jsigC <= ctx.args.joint_clk_max_sigma and (
+        _prim or abs(_jdJ) <= ctx.args.joint_clk_max_chips
     )
     # The delta is wrapped in the joint's window, so a clock off by whole periods of it reads
     # as a tiny delta and would be adopted every cycle, keeping this clock fresh and the
@@ -1501,6 +1614,12 @@ def dr_joint_clk(ctx):
             ctx.args.joint_clk_max_chips,
             ctx.args.joint_clk_max_sigma,
         )
+    # An adoption the legacy bound would have refused says so, under --joint-clk-primary.
+    _adopted = "ADOPTED"
+    if _prim and abs(_jdJ) > ctx.args.joint_clk_max_chips:
+        _adopted += (
+            " (primary: past the %.1f-chip legacy bound)" % ctx.args.joint_clk_max_chips
+        )
     # Fields before the bracket are in our chips; the bracket (other chip rates only) gives
     # the joint-chip numbers the bounds are tested in. A COAST's extrapolation and rate are
     # in joint chips too.
@@ -1519,7 +1638,7 @@ def dr_joint_clk(ctx):
             if _r == 1.0
             else " [x%.4f: joint %.3f delta %+.3f sigma %.3f in %.3f-Mcps chips, the"
             " bounds' unit]" % (_r, _jrC.clk, _jdJ, _jsigC, _jrate / 1e6),
-            "ADOPTED"
+            _adopted
             if _jokC
             else "COAST (refused: %s; %+.3f joint chips over %.0f s at clk_rate %+.4f "
             "joint chips/s)" % (_why, _jcoast[1], _jcoast[2], _jcoast[3])
@@ -1700,12 +1819,14 @@ def joint_read(ctx):
 def seeds_are_model_owned(ctx, prn):
     """Does the model own this PRN's seed, so a locked seed is slewed toward the model rather
     than left to the DLL? True without detectors, under --detectors-monitor (the search is
-    read, never seeded from: #209), and for a PRN the map has flipped to this chain. A chain
-    whose search seeds leaves locked seeds to the DLL."""
+    read, never seeded from: #209), for a PRN the map has flipped to this chain, and for one
+    the search no longer hints (dr_owns_unhinted). A chain whose search seeds leaves locked
+    seeds to the DLL."""
     return (
         not ctx.detectors
         or bool(getattr(ctx.args, "detectors_monitor", False))
         or prn in ctx.mp_flipped
+        or dr_owns_unhinted(ctx, prn)
     )
 
 
@@ -1995,7 +2116,10 @@ def dr_clock_long_chips(ctx):
     period."""
     if not getattr(ctx.args, "dr_clock_long", False) or ctx.lc_seg <= 1:
         return 0.0
-    rec = ctx.rx.clock_mod_epoch(min_epoch_s=0.0, t_now=ctx.t0)
+    # No age bound: the record is a run constant, and losing it would move every seed by whole
+    # code periods. A chain whose satellites are all locked and unhinted (--hint-skip-dr)
+    # detects nothing, so the record can go unrefreshed for hours.
+    rec = ctx.rx.clock_mod_epoch(min_epoch_s=0.0, max_age_s=None, t_now=ctx.t0)
     if rec is None or ctx.drp.clk_now is None:
         return 0.0
     ep = float(rec.extra["epoch_s"])
@@ -2091,6 +2215,25 @@ def dr_seed(ctx):
                 continue
             if ctx.capable is not None and prn not in ctx.capable:
                 continue  # its block does not broadcast this signal
+            # --hint-skip-dr hands a locked search seed to the model once the search stops hinting
+            # it and its last detection has expired: the hold is released, and from here the seed
+            # is slewed, as on a chain with no search. A detection hands it back (the loop at the
+            # end of stage_dead_reckon).
+            if (
+                ctag == ctx.drp.tag
+                and v["el"] >= ctx.args.mask_deg + 0.5
+                and prn in ctx.seeds
+                and prn not in ctx.dr_state["seeded"]
+                and prn not in ctx.best
+                and prn not in ctx.probe_set
+                and dr_owns_unhinted(ctx, prn)
+            ):
+                ctx.dr_state["seeded"].add(prn)
+                ctx.cp_held.discard(prn)
+                _log(
+                    "dead-reckon HANDOVER PRN %d: locked and no longer hinted -- the model "
+                    "owns its seed (slewed)" % prn
+                )
             # Seed above the mask + 0.5 deg, drop below the mask (the drop loop below): without the
             # hysteresis a satellite riding the mask flickers drop/reseed. A model-primary PRN stays
             # dead-reckon-owned while the search detects it, and is not skipped as untrusted:
@@ -2215,11 +2358,8 @@ def dr_seed(ctx):
             # joint state holds only satellites some chain detects.
             if ctx.drp.hold:
                 continue  # withheld: the clock is still the prime (stage_dead_reckon)
-            _leg_off = (
-                ctx.drp.clk_now
-                + dr_clock_long_chips(ctx)
-                + ctx.bsat.get(prn, ctx.drp.now_w)
-            )
+            _long = dr_clock_long_chips(ctx)
+            _leg_off = ctx.drp.clk_now + _long + ctx.bsat.get(prn, ctx.drp.now_w)
             _off = _leg_off
             _jr3, _w3, _tag3 = joint_read(ctx)
             # The joint is in reference chips (Receiver.joint_unit), converted into ours below as
@@ -2237,9 +2377,11 @@ def dr_seed(ctx):
             # carries this satellite's b_i, so an adopted offset is clk_now plus the wrapped
             # (clk + b_i - clk_now), with no b_sat in it, and b_sat cannot move the seed through
             # the bound either. A satellite the state does not hold, or one refused, keeps the
-            # legacy offset (b_sat included), as on the search-fed state.
+            # legacy offset (b_sat included), as on the search-fed state. Both keep the clock's
+            # whole long-code periods (--dr-clock-long): the joint offset is defined only within
+            # one code period.
             _drv3 = _trk3 and "slew" in ctx.joint_consume
-            _base3 = ctx.drp.clk_now if _drv3 else _leg_off
+            _base3 = ctx.drp.clk_now + _long if _drv3 else _leg_off
             # A seed rides clk + b_i only while b_i is settled (trk_unsettled); otherwise the
             # satellite keeps the legacy offset, as if the state did not hold it.
             _uns3 = (
@@ -2621,6 +2763,15 @@ def _dr_apply_reload(ctx, res):
     stalled that long holds up the telemetry fold: windows older than the telemetry ring's depth are
     evicted unfolded, which breaks the fleet-ADR arcs. Nothing here re-seeds: dr_seed reads the new
     model the same way it read the old one."""
+    # Exact, never `% ctx.drp.t_code`: the double period's error times 1.5e10 periods is tens of
+    # nanoseconds, and differs between code periods (t_mod_code). Set whether or not the reload
+    # succeeded: the decoded-orbit fallback models from it too.
+    ctx.dr_state["t0m"] = t_mod_code(
+        ctx.dr_eph_mod.gpst_of_utc(ctx.utc0_sample0),
+        ctx.lc_seg,
+        ctx.code_len,
+        ctx.args.chip_rate_hz,
+    )
     if res["error"]:
         _log(
             "dead-reckon: BRDC unavailable (%s); %s"
@@ -2635,14 +2786,6 @@ def _dr_apply_reload(ctx, res):
         return
     ctx.dr_state["eph"] = res["eph"]
     ctx.dr_state["eph_t"] = ctx.drp.now_w
-    # Exact, never `% ctx.drp.t_code`: the double period's error times 1.5e10 periods is tens of
-    # nanoseconds, and differs between code periods (t_mod_code).
-    ctx.dr_state["t0m"] = t_mod_code(
-        ctx.dr_eph_mod.gpst_of_utc(ctx.utc0_sample0),
-        ctx.lc_seg,
-        ctx.code_len,
-        ctx.args.chip_rate_hz,
-    )
     if res["has_dcb"]:
         ctx.dr_state["dcb"] = res["dcb"]
         ctx.dr_state["dcb_t"] = ctx.drp.now_w
@@ -2965,8 +3108,8 @@ def stage_dead_reckon(ctx):
         if _rl["done"] is not None:
             _res, _rl["done"], _rl["thread"] = _rl["done"], None, None
             _dr_apply_reload(ctx, _res)
-        # Decoded-ephemeris fallback: predict from this broker's own decoded ephemeris while no BRDC
-        # ephemeris is loaded.
+        # Decoded-ephemeris fallback: predict from the decoded ephemerides while no BRDC ephemeris
+        # is loaded, or (below) while the loaded one predicts none of this constellation.
         _use_decoded = (
             ctx.decfb is not None
             and ctx.args.decoded_eph_fallback
@@ -3103,14 +3246,7 @@ def stage_dead_reckon(ctx):
             elif ctx.dr_state.get("drift") is not None and _dt is None:
                 # an unstamped drift gets one full lifetime from now, not forever
                 ctx.dr_state["drift_t"] = ctx.drp.now_w
-            ctx.drp.drift = ctx.dr_state.get("drift")
-            _bias_drift = getattr(ctx.args, "dr_drift_source", "solve") == "bias"
-            if _bias_drift and ctx.cb.ema is not None:
-                # A free-running oscillator: the carrier bias is its frequency error, and the
-                # code clock runs off by the same fraction.
-                ctx.drp.drift = ctx.cb.ema * ctx.args.chip_rate_hz / ctx.args.carrier_hz
-            if ctx.drp.drift is None:
-                ctx.drp.drift = ctx.args.chip_rate_hz * ctx.drp.la
+            ctx.drp.drift = dr_drift(ctx)
             # The hop-axis epoch (#208): every model below is evaluated at _ep_w and labelled
             # _ep_age; nothing here reads the wall clock.
             _ep_age, _ep_w = dr_eph_epoch(ctx)
@@ -3134,6 +3270,67 @@ def stage_dead_reckon(ctx):
             try:
                 # Three epochs, _ep_w and _ep_w +- 2 s: the centred range-rate difference is the
                 # Doppler rate dr_seed ships (the TLE almanac's rate is not used here).
+                if not _use_decoded:
+                    # signal= refers sat_clk_s to this chain's code instead of the constellation's
+                    # broadcast clock reference (GPS L1/L2, Galileo E1/E5a or E1/E5b, BeiDou B3I),
+                    # using the DCB table's biases when loaded (gnss_ephemeris.group_delay_s).
+                    # cp_predicted consumes that clock, so it moves the seed directly.
+                    ctx.drp.pd = ctx.dr_eph_mod.predict_all(
+                        ctx.dr_state["eph"],
+                        ctx.args.lat,
+                        ctx.args.lon,
+                        ctx.args.alt,
+                        datetime.fromtimestamp(_ep_w, tz=timezone.utc),
+                        mask_deg=-90.0,
+                        signal=ctx.args.signal,
+                        dcb=ctx.dr_state.get("dcb"),
+                        tropo=_tropo,
+                        iono=_iono,
+                        memo=_memo,
+                        health_gate=False,
+                    )
+                    # Centred pair, +-2 s about the epoch: a forward difference over [t, t+4] would
+                    # estimate the rate at now+2 and hand it to the seed as the rate at now, and the
+                    # centred form has the smaller truncation error. The pair is read for this
+                    # chain's constellation only (dr_seed, dr_gdv, seeding), so only that is
+                    # predicted.
+                    ctx.drp.pd2 = ctx.dr_eph_mod.predict_all(
+                        ctx.dr_state["eph"],
+                        ctx.args.lat,
+                        ctx.args.lon,
+                        ctx.args.alt,
+                        datetime.fromtimestamp(_ep_w + 2.0, tz=timezone.utc),
+                        mask_deg=-90.0,
+                        signal=ctx.args.signal,
+                        dcb=ctx.dr_state.get("dcb"),
+                        tropo=_tropo,
+                        iono=_iono,
+                        sysc=ctx.drp.tag,
+                        health_gate=False,
+                    )
+                    pd0 = ctx.dr_eph_mod.predict_all(
+                        ctx.dr_state["eph"],
+                        ctx.args.lat,
+                        ctx.args.lon,
+                        ctx.args.alt,
+                        datetime.fromtimestamp(_ep_w - 2.0, tz=timezone.utc),
+                        mask_deg=-90.0,
+                        signal=ctx.args.signal,
+                        dcb=ctx.dr_state.get("dcb"),
+                        tropo=_tropo,
+                        iono=_iono,
+                        sysc=ctx.drp.tag,
+                        health_gate=False,
+                    )
+                    # Every record of this constellation is past best_eph's window (BRDC offline
+                    # for hours): predict from the decoded ephemerides instead, which the nav
+                    # decoders keep fresh while the satellites are tracked.
+                    _use_decoded = (
+                        ctx.decfb is not None
+                        and ctx.args.decoded_eph_fallback
+                        and ctx.drp.tag in ("G", "E", "C", "R")
+                        and not any(k[0] == ctx.drp.tag for k in ctx.drp.pd)
+                    )
                 if _use_decoded:
                     _ents = ctx.decoded_entries(_ep_w)
                     ctx.drp.pd = ctx.decfb.predict_from_decoders(
@@ -3190,65 +3387,46 @@ def stage_dead_reckon(ctx):
                                         (_tow + _dt) % 604800.0,
                                         _iono[2],
                                     )
+                    # GPS CNAV and BeiDou B-CNAV2 decode no clock. The broadcast clock
+                    # polynomial extrapolates far better than the orbit (11-23: ~2 m at 3 days,
+                    # ~20 m at 10), so a stale BRDC record supplies it.
+                    _n_clk = 0
+                    if ctx.dr_state["eph"]:
+                        _clk = ctx.dr_eph_mod.predict_all(
+                            ctx.dr_state["eph"],
+                            ctx.args.lat,
+                            ctx.args.lon,
+                            ctx.args.alt,
+                            datetime.fromtimestamp(_ep_w, tz=timezone.utc),
+                            mask_deg=-90.0,
+                            max_age=_sky.HINT_MAX_AGE_S,
+                            signal=ctx.args.signal,
+                            dcb=ctx.dr_state.get("dcb"),
+                            sysc=ctx.drp.tag,
+                        )
+                        for _rows in (ctx.drp.pd, ctx.drp.pd2, pd0):
+                            for _k, _v in _rows.items():
+                                if _v["sat_clk_s"] is None and _k in _clk:
+                                    _v["sat_clk_s"] = _clk[_k]["sat_clk_s"]
+                                    if _rows is ctx.drp.pd:
+                                        _n_clk += 1
+                    # A row with no clock has no code phase to model.
+                    for _rows in (ctx.drp.pd, ctx.drp.pd2, pd0):
+                        _none = [k for k, v in _rows.items() if v["sat_clk_s"] is None]
+                        for _k in _none:
+                            del _rows[_k]
                     if _now() - ctx.decfb_log_t[0] > 60.0:
                         ctx.decfb_log_t[0] = _now()
                         _log(
-                            "dead-reckon: predicting from DECODED eph (BRDC network "
-                            "DOWN -> fallback; %d entries -> %d sats)"
-                            % (len(_ents), len(ctx.drp.pd))
+                            "dead-reckon: predicting from DECODED eph (BRDC %s -> fallback; "
+                            "%d entries -> %d sats, %d clocks from BRDC)"
+                            % (
+                                "stale" if ctx.dr_state["eph"] else "down",
+                                len(_ents),
+                                len(ctx.drp.pd),
+                                _n_clk,
+                            )
                         )
-                else:
-                    # signal= refers sat_clk_s to this chain's code instead of the constellation's
-                    # broadcast clock reference (GPS L1/L2, Galileo E1/E5a or E1/E5b, BeiDou B3I),
-                    # using the DCB table's biases when loaded (gnss_ephemeris.group_delay_s).
-                    # cp_predicted consumes that clock, so it moves the seed directly.
-                    ctx.drp.pd = ctx.dr_eph_mod.predict_all(
-                        ctx.dr_state["eph"],
-                        ctx.args.lat,
-                        ctx.args.lon,
-                        ctx.args.alt,
-                        datetime.fromtimestamp(_ep_w, tz=timezone.utc),
-                        mask_deg=-90.0,
-                        signal=ctx.args.signal,
-                        dcb=ctx.dr_state.get("dcb"),
-                        tropo=_tropo,
-                        iono=_iono,
-                        memo=_memo,
-                        health_gate=False,
-                    )
-                    # Centred pair, +-2 s about the epoch: a forward difference over [t, t+4] would
-                    # estimate the rate at now+2 and hand it to the seed as the rate at now, and the
-                    # centred form has the smaller truncation error. The pair is read for this
-                    # chain's constellation only (dr_seed, dr_gdv, seeding), so only that is
-                    # predicted.
-                    ctx.drp.pd2 = ctx.dr_eph_mod.predict_all(
-                        ctx.dr_state["eph"],
-                        ctx.args.lat,
-                        ctx.args.lon,
-                        ctx.args.alt,
-                        datetime.fromtimestamp(_ep_w + 2.0, tz=timezone.utc),
-                        mask_deg=-90.0,
-                        signal=ctx.args.signal,
-                        dcb=ctx.dr_state.get("dcb"),
-                        tropo=_tropo,
-                        iono=_iono,
-                        sysc=ctx.drp.tag,
-                        health_gate=False,
-                    )
-                    pd0 = ctx.dr_eph_mod.predict_all(
-                        ctx.dr_state["eph"],
-                        ctx.args.lat,
-                        ctx.args.lon,
-                        ctx.args.alt,
-                        datetime.fromtimestamp(_ep_w - 2.0, tz=timezone.utc),
-                        mask_deg=-90.0,
-                        signal=ctx.args.signal,
-                        dcb=ctx.dr_state.get("dcb"),
-                        tropo=_tropo,
-                        iono=_iono,
-                        sysc=ctx.drp.tag,
-                        health_gate=False,
-                    )
             except Exception as e:
                 ctx.drp.pd, ctx.drp.pd2, pd0 = {}, {}, {}
                 _log("dead-reckon: predict failed: %s" % e)

@@ -31,6 +31,11 @@ computed belongs in the stage that computes it or on one of the owner objects (`
 _UNSET = object()
 
 
+def _warm_state():
+    """The warm search's rotation (searchhint._warm_hints): next index, turn start, PRNs."""
+    return {"i": 0, "t": float("-inf"), "cur": []}
+
+
 class ChainContext(object):
     """Reference holder for one chain's cycle. See the module docstring for the two halves."""
 
@@ -64,6 +69,7 @@ class ChainContext(object):
         "fe_off",
         "capable",
         "capable_t",
+        "fdma_t",
         "alm_now",
         "trackers",
         "joint_consume",
@@ -134,6 +140,8 @@ class ChainContext(object):
         "birth_steps",
         # {combiner url: (newest pow_hop, first seen at it)}, for fleet.live_instances
         "fleet_hop_hist",
+        # the warm search's rotation (searchhint._warm_hints)
+        "warm",
         # ---- per-cycle: written directly by the stage that computes them ---------------
         # Attributes rather than loop locals because a module-level stage can assign
         # `ctx.have_sig`, where it could not declare `nonlocal have_sig`.
@@ -157,6 +165,10 @@ class ChainContext(object):
         # clock and frequency-bias solves, the joint state's rows, the fleet code medians).
         "unhealthy",
         "up",
+        # PRNs of this chain no orbit source predicts, for the warm search (searchhint) and the
+        # seeding, which treats them as up; set() while the constellation is listed
+        # (almanac._unpredicted)
+        "unpredicted",
         "probe_set",
         "utc0_sample0",
         "coast_polls",
@@ -187,6 +199,9 @@ class ChainContext(object):
         "unhealthy": set,
         "birth_steps": dict,
         "fleet_hop_hist": dict,
+        "unpredicted": set,
+        "warm": _warm_state,
+        "fdma_t": float,
     }
 
     def __init__(self, **kw):

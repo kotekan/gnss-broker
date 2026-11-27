@@ -39,8 +39,10 @@ sys.path.insert(0, HERE)
 import bcnav1_predictor  # noqa: E402
 import bcnav2_predictor  # noqa: E402
 import bcnav3_predictor  # noqa: E402
+import bds_d1_predictor  # noqa: E402
 import cnav2_predictor  # noqa: E402
 import cnav_predictor  # noqa: E402
+import sbas_l5_predictor  # noqa: E402
 import fnav_predictor  # noqa: E402
 import inav_predictor  # noqa: E402
 import navobs_align  # noqa: E402
@@ -68,6 +70,46 @@ def _emit(utc_ref, n=8):
         "br": 1,
         "bits": [[i, 1 - 2 * (i % 2)] for i in range(n)],
     }
+
+
+class TestOffGridEmits(unittest.TestCase):
+    """SymbolHistory drops an emit whose symbols fall off its grid (the combiner's bit sync
+    briefly picked the other phase of a 2-record symbol), and restarts on a grid that holds."""
+
+    def _emit(self, h, t0, n=200):
+        rng = np.random.RandomState(int(t0 * 1e3) % 1000)
+        sg = rng.choice([-1, 1], n)
+        h.ingest(
+            7,
+            {
+                "utc_ref": t0,
+                "rec_dt": 0.001,
+                "phase": 0,
+                "br": 2,
+                "bits": [[i, int(v)] for i, v in enumerate(sg)],
+                "soft": [int(30 * v) for v in sg],
+            },
+        )
+
+    def test_brief_flip_dropped_and_lasting_shift_restarts(self):
+        class H(navobs_align.SymbolHistory):
+            def new_state(self):
+                return navobs_align.HistoryState()
+
+            def _decode(self, prn, st):
+                pass
+
+        h = H()
+        self._emit(h, 100.000)
+        self._emit(h, 100.200)
+        st = h._p[7]
+        restarts, n = st.restarts, len(st.hist)
+        for k in range(h.grid_debounce - 1):  # half a symbol off the grid
+            self._emit(h, 100.401 + 0.2 * k)
+        self.assertEqual(st.restarts, restarts, "a brief flip must not restart the history")
+        self.assertEqual(len(st.hist), n, "nor merge its symbols")
+        self._emit(h, 100.401 + 0.2 * (h.grid_debounce - 1))
+        self.assertEqual(st.restarts, restarts + 1, "a lasting shift restarts on the new grid")
 
 
 class TestPerPrnGate(unittest.TestCase):
@@ -117,6 +159,8 @@ class TestDistinctCounts(unittest.TestCase):
         (bcnav2_predictor, bcnav2_predictor.Bcnav2Predictor, 6),  # 3 x types 10, 11
         (bcnav1_predictor, bcnav1_predictor.Bcnav1Predictor, 2),  # 2 frames
         (bcnav3_predictor, bcnav3_predictor.Bcnav3Predictor, 6),  # 3 x types 10, 30
+        (bds_d1_predictor, bds_d1_predictor.D1Predictor, 9),  # 3 x subframes 1-3
+        (sbas_l5_predictor, sbas_l5_predictor.SbasL5Predictor, 10),  # 12 less warm-up
     )
 
     def test_rescans_do_not_count_again(self):
@@ -134,6 +178,12 @@ class TestDistinctCounts(unittest.TestCase):
 
     def test_seen_slots_pruned_with_the_emit_cache(self):
         for mod, cls, _n in self.CASES:
+            if cls in (
+                bcnav3_predictor.Bcnav3Predictor,
+                bds_d1_predictor.D1Predictor,
+                sbas_l5_predictor.SbasL5Predictor,
+            ):
+                continue  # not slots pruned with an emit cache (test_bcnav3_sow_counted_once)
             with self.subTest(cls=cls.__name__):
                 pred = cls()
                 pred._decode = lambda prn, st: None
@@ -150,6 +200,27 @@ class TestDistinctCounts(unittest.TestCase):
                 for k in names:
                     self.assertNotIn(-1, getattr(st, k))
                     self.assertIn(10 ** 9, getattr(st, k))
+
+
+class TestBcnav3Sow(unittest.TestCase):
+    def test_bcnav3_sow_counted_once(self):
+        # the same frame found in two overlapping emits counts once; old SOWs are forgotten
+        pred = bcnav3_predictor.Bcnav3Predictor()
+        st = bcnav3_predictor._PrnState()
+        frame = ([0] * 486, 1000, 10)
+        with mock.patch.object(
+            bcnav3_predictor.B,
+            "find_frames",
+            lambda s, prn: iter([(0, 1, frame[0], frame[2], frame[1])]),
+        ):
+            for _ in range(2):
+                st.pending = [(0.0, 0.001, np.ones(1000))]
+                pred._decode(7, st)
+        self.assertEqual(st.n_frames, 1)
+        st.seen.update(range(-10000, -10000 + 7300))
+        st.pending = []
+        pred._decode(7, st)
+        self.assertEqual(st.seen, {1000})
 
 
 def _bcnav2_stream(prn_field):
@@ -211,6 +282,7 @@ class TestCnavGlobalSign(unittest.TestCase):
         pred._g2 = False
         st = pred._p.setdefault(prn, cnav_predictor._PrnState())
         st.phase = 0
+        st.sym_s, st.edge_s = 0.01, 0.0
         starts = [200 * k for k in range(10)]
         for s0 in starts:
             st.emits[s0] = (pm[s0 : s0 + 201] * sign).astype(np.int8)

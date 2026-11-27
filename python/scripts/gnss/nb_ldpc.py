@@ -178,6 +178,13 @@ def gf_inv(a):
     return GF_VEC[(Q_GF - 1 - GF_POW[a]) % (Q_GF - 1)]
 
 
+# _QBITS[q][j]: bit j of GF symbol q, most significant first (bin2gf's order)
+_QBITS = np.array(
+    [[(q >> (N_GF - 1 - j)) & 1 for j in range(N_GF)] for q in range(Q_GF)],
+    dtype=np.uint8,
+)
+
+
 def bin2gf(syms):
     n = len(syms) // N_GF
     code = np.zeros(n, dtype=np.uint8)
@@ -261,20 +268,30 @@ def _check_parity(GM, ie, je, he, n_check, code):
     return bool(np.all(s == 0))
 
 
-def decode(H_idx, H_ele, m, n, syms):
-    """syms: n*6 hard bits (0/1). Returns (info_bits[m*6], nerr). nerr>=0 decoded (0=clean),
-    -1 = failed to converge."""
+def decode(H_idx, H_ele, m, n, syms, rel=None, cost=None):
+    """syms: n*6 hard bits (0/1). rel: optional n*6 reliabilities (|soft value|), each bit's
+    cost of being flipped; without them every bit costs the same. cost: optional n x 64 costs of
+    each GF symbol taking each value, for a channel that sends whole symbols (GuoWang's CSK);
+    it replaces syms and rel. Returns (info_bits[m*6], nerr). nerr>=0 decoded (0=clean), -1 =
+    failed to converge."""
     GM = init_gf()
-    s = np.asarray(syms, dtype=np.uint8)
-    code = bin2gf(s)
     ie, je, he, ne, check_edges, var_edges = _edges(H_idx, H_ele, m, n)
     V2C = np.zeros((ne, Q_GF), dtype=np.float32)
     C2V = np.zeros((ne, Q_GF), dtype=np.float32)
-    L = np.zeros((n, Q_GF), dtype=np.float32)
-    c0 = -math.log(ERR_PROB)
-    for i in range(n):
-        for j in range(Q_GF):
-            L[i][j] = c0 * bin(int(code[i]) ^ j).count("1")
+    if cost is not None:
+        L = np.asarray(cost, dtype=np.float32)
+        code = np.argmin(L, axis=1).astype(np.uint8)
+        s = gf2bin(code)
+    else:
+        s = np.asarray(syms, dtype=np.uint8)
+        code = bin2gf(s)
+        c0 = -math.log(ERR_PROB)
+        # L[i][q]: the cost of GF symbol i being q, the summed reliability of the bits q flips
+        r = np.ones(n * N_GF) if rel is None else np.asarray(rel, dtype=float)
+        flips = _QBITS[None, :, :] != s.reshape(n, N_GF)[:, None, :]
+        L = (c0 * (flips * r.reshape(n, N_GF)[:, None, :]).sum(axis=2)).astype(
+            np.float32
+        )
     for e in range(ne):
         V2C[e] = _permute_V2C(GM, he[e], L[je[e]])
     for _ in range(MAX_ITER):
@@ -309,6 +326,68 @@ def decode(H_idx, H_ele, m, n, syms):
         dec = gf2bin(code)
         return dec[: m * N_GF], int(np.count_nonzero(dec ^ s))
     return gf2bin(code)[: m * N_GF], -1
+
+
+def _wht(x):
+    """Walsh-Hadamard transform over the last axis (64), unnormalized: the XOR group's
+    Fourier transform, which turns the sum of GF(64) symbols into a product."""
+    shape = x.shape
+    h = 1
+    while h < Q_GF:
+        x = x.reshape(shape[:-1] + (Q_GF // (2 * h), 2, h))
+        a, b = x[..., 0, :], x[..., 1, :]
+        x = np.stack((a + b, a - b), axis=-2)
+        h *= 2
+    return x.reshape(shape)
+
+
+def decode_bp(H_idx, H_ele, m, n, logp, max_iter=50):
+    """Belief propagation over GF(64) (the FFT/WHT sum-product): each check node combines its
+    other edges' symbol distributions through the Walsh-Hadamard transform, so every message is
+    a whole distribution rather than EMS's best NM_EMS values. A missing symbol enters as a flat
+    distribution and is recovered from the code, which EMS cannot rank. logp: n x 64 channel
+    log-probabilities of each symbol's values (a flat row for an erasure). Returns
+    (info_bits[m*6], symbols changed from the channel's best), or (bits, -1) when the parity
+    checks never hold."""
+    GM = init_gf()
+    hi = np.asarray(H_idx, dtype=np.int64)
+    he = np.asarray(H_ele, dtype=np.int64)
+    d_c = hi.shape[1]
+    ev, eh = hi.ravel(), he.ravel()
+    mul = GM[eh].astype(np.int64)  # mul[e][a] = h_e * a
+    lp = np.asarray(logp, dtype=float)
+    lp = lp - lp.max(axis=1, keepdims=True)
+    q = np.exp(lp[ev])
+    q /= q.sum(axis=1, keepdims=True)
+    first = lp.argmax(axis=1)
+    hard = first
+    for _ in range(max_iter):
+        # the permuted message h*x: qp[e][h a] = q[e][a]
+        qp = np.empty_like(q)
+        np.put_along_axis(qp, mul, q, axis=1)
+        w = _wht(qp).reshape(m, d_c, Q_GF)
+        # each edge's product over the check's other edges, from prefix and suffix products
+        pre = np.ones_like(w)
+        suf = np.ones_like(w)
+        for k in range(1, d_c):
+            pre[:, k] = pre[:, k - 1] * w[:, k - 1]
+            suf[:, d_c - 1 - k] = suf[:, d_c - k] * w[:, d_c - k]
+        rp = _wht((pre * suf).reshape(m * d_c, Q_GF)) / Q_GF
+        rp = np.maximum(rp, 1e-30)
+        r = np.take_along_axis(rp, mul, axis=1)  # back from h*x to x
+        r /= r.sum(axis=1, keepdims=True)
+        lr = np.log(r)
+        tot = lp.copy()
+        np.add.at(tot, ev, lr)
+        hard = tot.argmax(axis=1)
+        syn = np.bitwise_xor.reduce(GM[eh, hard[ev]].reshape(m, d_c), axis=1)
+        if not syn.any():
+            return gf2bin(hard)[: m * N_GF], int(np.count_nonzero(hard != first))
+        lq = tot[ev] - lr
+        lq -= lq.max(axis=1, keepdims=True)
+        q = np.exp(lq)
+        q /= q.sum(axis=1, keepdims=True)
+    return gf2bin(hard)[: m * N_GF], -1
 
 
 def encode_systematic(H_idx, H_ele, m, n, info_syms):

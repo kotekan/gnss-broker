@@ -41,6 +41,7 @@ polarity-scrambled emits -> the CRC-guided decoder must recover the messages and
 ephemeris; g2=False wins there because the synthetic symbols use the module convention).
 """
 import itertools
+import math
 import os
 import sys
 import time
@@ -91,6 +92,9 @@ COLD_BACKOFF_MAX = (
 SYM_MAX = 9600  # keep ~3 min of L2C symbols per PRN
 DECODED_MAX = 80  # keep the last ~80 decoded messages (~16 min)
 TRY_EVERY_SYMS = 200  # attempt a decode once per ~4 s of new symbols per PRN
+# A PRN takes part in the decode rotation while its emits keep arriving: nav_decode polls an
+# L2C source every ~22 s, the broker every second.
+ROUND_LIVE_S = 60.0
 
 
 def _crc_msgs(bits):
@@ -120,18 +124,36 @@ def _g2(x, on):
     return y
 
 
+def _due(st):
+    """A decode attempt is due: never tried, or TRY_EVERY_SYMS new symbols since the last."""
+    if st.try_slot is None:
+        return True
+    if not st.emits:
+        return False
+    newest = max(s + len(a) - 1 for s, a in st.emits.items())
+    return newest - st.try_slot >= TRY_EVERY_SYMS
+
+
 class _PrnState:
     def __init__(self):
         self.emits = {}  # slot0 -> np.array(+-1 signs), one sign island per stored emit
         self.last_obs = None  # (utc_ref, phase, br) dedup
+        self.t_seen = 0.0  # wall time of the newest emit
         self.try_slot = None
         self.phase = (
             None  # per-PRN locked pair_phase (pseudorange shifts the symbol grid)
         )
         self.pol = {}  # slot0 -> resolved island sign (+-1) in one consistent frame
         self.decoded = {}  # start_slot -> data bits[300] (0/1), CRC-verified
+        # start_slot -> host-labelled UTC of the message's first symbol edge, placed when it
+        # first decodes: symbol edges move ~3 us/s against the slot grid, and a message is
+        # kept ~16 min
+        self.t_host = {}
+        self.sym_s = None  # slot period, s
+        self.edge_s = 0.0  # slot * sym_s + edge_s is a symbol edge's host-labelled UTC
         self.eph10 = None
         self.eph11 = None
+        self.clk = None  # the newest type 30-37 (its clock block)
         self.n_decoded = 0
         self.boot = 0  # cold-bootstrap (phase, g2) rotation counter
         self.cold_fail = (
@@ -181,14 +203,19 @@ class CnavPredictor:
             return
         st.last_obs = key
         sym_s = br * rec_dt
+        st.sym_s = sym_s
         # Build this emit's absolute slot -> sign map (no polarity applied: each emit is its own
         # sign island; the decoder resolves inter-emit polarity by CRC).
         m = {}
+        frac = None
         for bi, sg in pairs:
             bi, sg = int(bi), int(sg)
             if sg not in (1, -1):
                 continue
-            slot = int(round((utc_ref + (bi * br - phase) * rec_dt) / sym_s))
+            t_edge = utc_ref + (bi * br - phase) * rec_dt
+            slot = int(round(t_edge / sym_s))
+            if frac is None:
+                frac = t_edge - slot * sym_s
             m[slot] = sg
         if len(m) < 2:
             return
@@ -201,10 +228,15 @@ class CnavPredictor:
             arr == 0
         ).any():  # a gap inside the emit breaks the convolutional stream: drop it
             return
+        # Seen only once an emit is kept: a slot whose every emit has a gap (an untracked one)
+        # would otherwise stay eligible for the decode round below without ever taking a turn,
+        # and the round, never complete, would stop every PRN decoding (11-24).
+        st.t_seen = time.time()
         # a symbol edge near half a slot can round this emit one slot off the history it
         # overlaps; line it up with that history
         d = emit_offset(slot0, arr, st.emits.items())
         slot0, hi = slot0 + d, hi + d
+        st.edge_s = frac - d * sym_s
         if not self._merge(st, slot0, arr):
             st.emits[slot0] = arr
         # Bound the cache to the newest SYM_MAX symbols: drop the oldest islands, and trim the
@@ -245,14 +277,18 @@ class CnavPredictor:
         ):
             st.try_slot = newest
             self._round.add(prn)
-            # a round is complete once every currently-eligible PRN has had a turn (backed-off cold
-            # PRNs are not eligible, so they don't stall the rotation among the active ones).
-            eligible = sum(
-                1
-                for s2 in self._p.values()
-                if s2.phase is not None or now >= s2.cold_next_t
-            )
-            if len(self._round) >= max(1, eligible):
+            # a round is complete once every currently-eligible PRN has had a turn. Backed-off
+            # cold PRNs are not eligible, nor PRNs whose emits stopped (a satellite that set),
+            # nor PRNs with nothing new to decode: counting those, the round never completed
+            # and every PRN stopped decoding (11-24, a bootstrap's decoder for 4 min).
+            eligible = [
+                p2
+                for p2, s2 in self._p.items()
+                if now - s2.t_seen < ROUND_LIVE_S
+                and (s2.phase is not None or now >= s2.cold_next_t)
+                and _due(s2)
+            ]
+            if all(p2 in self._round for p2 in eligible):
                 self._round.clear()
             self._try_decode(prn, st)
             self._last_decode = time.time()
@@ -444,10 +480,13 @@ class CnavPredictor:
                     for m in msgs:
                         ss = lo + ph + 2 * m["index"]
                         st.decoded[ss] = np.array(m["bits"], dtype=np.int8)
+                        st.t_host.setdefault(ss, ss * st.sym_s + st.edge_s)
                         if m["type"] == 10:
                             st.eph10 = st.decoded[ss]
                         elif m["type"] == 11:
                             st.eph11 = st.decoded[ss]
+                        elif 30 <= m["type"] <= 37:
+                            st.clk = st.decoded[ss]
                         st.n_decoded += 1
                         for c in chain:
                             if (
@@ -461,6 +500,7 @@ class CnavPredictor:
                     if len(st.decoded) > DECODED_MAX:
                         for s in sorted(st.decoded)[:-DECODED_MAX]:
                             st.decoded.pop(s, None)
+                            st.t_host.pop(s, None)
                     for s in list(st.pol):  # bound pol to live emits
                         if s not in st.emits:
                             st.pol.pop(s, None)
@@ -468,13 +508,22 @@ class CnavPredictor:
 
     # ---------------- serve ----------------
     def ephemeris(self, prn):
-        """CNAV ephemeris (SI) from the latest type-10 + type-11, consistency-gated toe==toe2."""
+        """CNAV ephemeris (SI) from the latest type-10 + type-11, consistency-gated toe==toe2,
+        with the clock of the latest type 30-37 when its toc is the toe (one upload). The clock
+        rides with sqrtA and dn, the Kepler terms decoded_eph's relativistic term reads, which
+        CNAV carries as dA and dn0."""
         st = self._p.get(prn)
         if st is None or st.eph10 is None or st.eph11 is None:
             return None
         eph = C.parse_cnav_ephemeris(list(st.eph10), list(st.eph11))
         if abs(eph["toe"] - eph["toe2"]) > 1e-6:
             return None
+        if st.clk is not None:
+            clk = C.parse_cnav_clock(list(st.clk))
+            if clk["toc"] == eph["toe"]:
+                eph.update(clk)
+                eph["sqrtA"] = math.sqrt(C.AREF + eph["dA"])
+                eph["dn"] = eph["dn0"]
         return eph
 
     def health(self, prn):
@@ -555,6 +604,26 @@ def _selftest():
     )
     for k in ("e", "M0", "toe", "OMEGA0"):
         assert abs(eph[k] - truth[k]) < 1e-9, "ephemeris field %s mismatch" % k
+
+    # A live, locked satellite with nothing new to decode (its newest symbol behind its last
+    # try) must not hold the round: the other satellites keep decoding.
+    pred = CnavPredictor()
+    pred._min_gap = 0.0
+    tries = []
+
+    def count_try(p, st):
+        tries.append(p)
+
+    pred._try_decode = count_try
+    held = pred._p.setdefault(9, _PrnState())
+    held.phase, held.t_seen, held.try_slot = 0, time.time(), 10**9
+    held.emits = {0: np.ones(10, dtype=np.int8)}
+    for k in range(5):
+        obs = {"utc_ref": k * 400 * SYM_S, "rec_dt": SYM_S, "phase": 0, "br": 1}
+        obs["bits"] = [[i, 1] for i in range(300)]
+        pred.ingest(prn, obs)
+    msg = "a satellite with nothing to decode held the round: %d of 5" % len(tries)
+    assert len(tries) == 5, msg
     print("PASS")
 
 

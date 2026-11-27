@@ -199,6 +199,25 @@ def _nh_joint_consensus(ctx, now):
     return ctx.cpt.nh_common
 
 
+def _nh_model_offset(ctx):
+    """--nh-joint model: the common overlay offset is the receiver clock itself, known mod the
+    overlay epoch from a sibling chain's clock-mod-epoch record (gps_l5's NH20 joint fit), not a
+    vote of this chain's own detections. For a search that cannot see its overlay segment (SBAS
+    L5's 2 ms Manchester pair searched in 1 ms windows: both halves correlate alike, and the
+    reported half follows the snapshot's alignment, the same for every satellite) the votes are
+    noise. Returns (offset chips,), as _nh_joint_consensus, or None while no record covers the
+    epoch."""
+    rx = getattr(ctx, "rx", None)
+    rec = (
+        rx.clock_mod_epoch(min_epoch_s=ctx.lc_epoch, exclude=ctx.chain_id, t_now=ctx.t0)
+        if rx is not None
+        else None
+    )
+    if rec is None:
+        return None
+    return ((rec.value % ctx.lc_epoch) * ctx.args.chip_rate_hz,)
+
+
 def _nh_joint_snap(ctx, prn, ph_ref, ref_hop, dstar):
     """Snap a measured phase's overlay segment to the consensus, keeping its fine phase: the
     segment comes from (prediction + common offset), the sub-chip phase from the measurement.
@@ -216,13 +235,15 @@ def stage_coast_drop(ctx):
     A visible seed that was not re-detected keeps its anchor and has its Doppler forecast
     forward; it is dropped once its lock metric has stayed below the bar for the coast budget.
     Noise probes are left alone, and dead-reckoned seeds are exempt from both drops (see the
-    module docstring)."""
+    module docstring). A satellite no orbit source predicts (ctx.unpredicted, the warm search's)
+    has no elevation to set by and drops only by its lock."""
     for prn in list(ctx.seeds):
         if prn in ctx.probe_set:
             continue
         if (
             ctx.up is not None
             and prn not in ctx.up
+            and prn not in ctx.unpredicted
             and not (ctx.dr_state is not None and prn in ctx.dr_state["seeded"])
         ):
             _log("drop PRN %d (set below horizon)" % prn)
@@ -389,8 +410,13 @@ def stage_detections_to_seeds(ctx):
         v_dr = ctx.dr_pd.get((ctx.args.dr_constellation, prn)) if ctx.dr_pd else None
         if ctx.up is not None and prn not in ctx.up:
             # Accept it anyway if the dead-reckon BRDC sky has it above the mask: the almanac up-set
-            # can disagree (the TLE almanac mismaps some BeiDou PRNs).
-            if v_dr is None or v_dr["el"] < ctx.args.mask_deg:
+            # can disagree (the TLE almanac mismaps some BeiDou PRNs). A PRN no orbit source
+            # predicts (the warm search's) is taken on its detection alone, if that clears
+            # --warm-search-min-snr.
+            if prn in ctx.unpredicted:
+                if snr < ctx.args.warm_search_min_snr:
+                    continue
+            elif v_dr is None or v_dr["el"] < ctx.args.mask_deg:
                 continue
         # The search is the admission authority for the trim presence gate
         # (--dll-deep-gate-from-search). Stamped after the visibility filter, so a spurious
@@ -466,7 +492,9 @@ def stage_detections_to_seeds(ctx):
         # solve, so waiting for it would only withhold every first seed on a chain that never
         # sees bias_min_sats fresh detections. The wait there is for drp.now_w: on a chain's
         # first cycle this stage runs before the dead-reckon stage stamps it, and a first seed
-        # then would raise in _nh_joint_consensus.
+        # then would raise in _nh_joint_consensus. A PRN no orbit predicts (the warm search's)
+        # waits for neither: it takes no part in the overlay vote, its seed carries the measured
+        # Doppler, and on a chain that predicts nothing the dead-reckon stage never stamps now_w.
         if (
             _prev_sd is None
             and ctx.args.almanac
@@ -475,6 +503,7 @@ def stage_detections_to_seeds(ctx):
                 if ctx.args.seed_bias_source == "zero"
                 else not ctx.cb.available
             )
+            and prn not in ctx.unpredicted
         ):
             continue
         if _prev_sd is None:
@@ -779,6 +808,7 @@ def stage_detections_to_seeds(ctx):
                 # the vote, the referee and the apply-side snap read this, never the debounced ph
                 if (
                     _nhj_ok
+                    and ctx.args.nh_joint == "apply"
                     and snr >= ctx.args.nh_joint_min_snr
                     and prn not in ctx.unhealthy
                 ):
@@ -878,7 +908,11 @@ def stage_detections_to_seeds(ctx):
                 # fine phase. ph_hist was fed above from measured phases only, so nothing derived is
                 # stored as the satellite's own word.
                 if _nhj_ok:
-                    _nhc = _nh_joint_consensus(ctx, ctx.drp.now_w)
+                    _nhc = (
+                        _nh_model_offset(ctx)
+                        if ctx.args.nh_joint == "model"
+                        else _nh_joint_consensus(ctx, ctx.drp.now_w)
+                    )
                     if _nhc is not None:
                         # The derived segment applies to every satellite, strong included: the
                         # consensus is the weighted median of the strong population's raw phases, so

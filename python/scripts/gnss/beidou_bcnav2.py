@@ -170,28 +170,40 @@ def check_crc(bits):
     return ok, _uint(b[0:6]), _uint(b[6:12]), _uint(b[12:30])
 
 
+def frame_candidates(symbols):
+    """[(start_index, polarity)] where the N_PRE symbols (bipolar, bit 1 < 0) match the
+    preamble exactly, in either polarity, for a whole frame that fits."""
+    s = np.asarray(symbols, dtype=float)
+    n = len(s)
+    if n < FRAME_SYMS:
+        return []
+    pre = 1.0 - 2.0 * np.array(PREAMBLE, dtype=float)
+    hard = np.where(s < 0, -1.0, 1.0)
+    c = np.correlate(hard[: n - FRAME_SYMS + N_PRE], pre, "valid")
+    return [(int(i), 1 if c[i] > 0 else -1) for i in np.nonzero(np.abs(c) == N_PRE)[0]]
+
+
+def decode_frame(symbols, i, pol):
+    """(info_bits[288], prn, mestype, sow) of the frame whose preamble starts at i, decoded in
+    polarity pol, or None unless the NB-LDPC converges and the CRC passes."""
+    seg = pol * np.asarray(symbols[i + N_PRE : i + FRAME_SYMS], dtype=float)
+    bits, nerr = decode_nb_ldpc((seg < 0).astype(np.uint8))
+    if nerr < 0:
+        return None
+    lb = [int(b) for b in bits]  # list: composes with _field (I/NAV)
+    ok, prn, mt, sow = check_crc(lb)
+    return (lb, prn, mt, sow) if ok else None
+
+
 def find_frames(symbols):
     """Scan a soft symbol stream (+~0 / -~1 bipolar) for preamble-aligned frames, both
     polarities. Yields (start_index, polarity, info_bits[288], prn, mestype, sow) per CRC-OK
-    frame. Steps by 1 (never jumps on a bare preamble; the CRC is the true filter)."""
-    s = np.asarray(symbols, dtype=float)
-    n = len(s)
-    pre = np.array(PREAMBLE, dtype=np.int8)
-    i = 0
-    while i + FRAME_SYMS <= n:
-        for pol in (1.0, -1.0):
-            hard = (pol * s[i : i + N_PRE] < 0).astype(np.int8)
-            if np.array_equal(hard, pre):
-                # the 576 LDPC symbols after the preamble, as hard bits (0/1)
-                ldpc = (pol * s[i + N_PRE : i + FRAME_SYMS] < 0).astype(np.uint8)
-                bits, nerr = decode_nb_ldpc(ldpc)
-                if nerr >= 0:
-                    lb = [int(b) for b in bits]  # list: composes with _field (I/NAV)
-                    ok, prn, mt, sow = check_crc(lb)
-                    if ok:
-                        yield i, int(pol), lb, prn, mt, sow
-                        break
-        i += 1
+    frame. Every preamble match is tried (never jumps on a bare preamble; the CRC is the true
+    filter)."""
+    for i, pol in frame_candidates(symbols):
+        r = decode_frame(symbols, i, pol)
+        if r is not None:
+            yield (i, pol) + tuple(r)
 
 
 # ------------------------------------------------------------------ ephemeris (types 10, 11)
@@ -227,6 +239,25 @@ BCNV2_EPH_FIELDS = {
     "C_UC": (11, 243, 21, True, _P(30)),
 }
 _IODE_10 = (53, 8)  # (start, len) -- IODE in type 10 (type 11 has none)
+WN_10 = (30, 13)  # (start, len) -- BDT week number in type 10, after SOW
+# The clock block, t_oc(11, x300 s) a0(25, 2^-34 s) a1(22, 2^-50) a2(11, 2^-66), IODC(10) after
+# it, by message type: after the status flags in types 30-33, after SISAI_oc in type 34. Found
+# on live frames (11-24): the clock matches the BRDC's to 0.3 ns, with t_oc = t_oe.
+BCNV2_CLK_AT = {30: 42, 31: 42, 32: 42, 33: 42, 34: 64}
+
+
+def parse_bcnav2_clock(frame, mestype):
+    """{t_oc, a0, a1, a2} (s, s/s, s/s^2; t_oc in BDT seconds of week) from a type 30-34
+    frame, or None for another type."""
+    at = BCNV2_CLK_AT.get(mestype)
+    if at is None:
+        return None
+    return {
+        "t_oc": _field(frame, at, 11, False, 300.0),
+        "a0": _field(frame, at + 11, 25, True, _P(34)),
+        "a1": _field(frame, at + 36, 22, True, _P(50)),
+        "a2": _field(frame, at + 58, 11, True, _P(66)),
+    }
 
 
 def parse_bcnav2_ephemeris(frames_by_type):
@@ -245,14 +276,15 @@ def parse_bcnav2_ephemeris(frames_by_type):
     return eph
 
 
-def sv_position_bcnav2(eph, t):
+def sv_position_bcnav2(eph, t, wrap=True):
     """ECEF (x,y,z) m -- BDS-3 CNAV-style propagation (A from dA/Adot, n from dn0/dn0dot),
-    BDS constants. Handles the MEO/IGSO rotation; GEO (SatType 1) gets the extra -5deg tilt."""
+    BDS constants. Handles the MEO/IGSO rotation; GEO (SatType 1) gets the extra -5deg tilt.
+    wrap=False: t counts on from the start of t_oe's week (an issue more than half a week old)."""
     A0 = eph["A_ref"] + eph["dA"]
     tk = t - eph["t_oe"]
-    if tk > 302400:
+    if wrap and tk > 302400:
         tk -= 604800
-    elif tk < -302400:
+    elif wrap and tk < -302400:
         tk += 604800
     A = A0 + eph["A_dot"] * tk
     n0 = math.sqrt(BDS_MU / A0 ** 3)

@@ -920,12 +920,13 @@ def build_parser(description):
     ap.add_argument(
         "--hint-skip-dr",
         action="store_true",
-        help="with --narrow-search, hint no PRN this chain can dead-reckon: its clock is "
-        "fresh and the model predicts the PRN with a clock known to half a chip (a "
-        "broadcast or decoded orbit, not a GuoWang catalogue record) and does not mark "
-        "it untrusted. The search then scans only the rest. The clock stays fresh only "
-        "from a source other than this chain's detections (joint-consume clk, or a "
-        "donor); otherwise hints return each time it goes stale. Off by default.",
+        help="with --narrow-search, hint no PRN that is locked (fleet q >= lock_q) and "
+        "that this chain can dead-reckon: its clock is fresh and the model predicts the "
+        "PRN with a clock known to half a chip (a broadcast or decoded orbit, not a "
+        "GuoWang catalogue record) and does not mark it untrusted. The dead-reckon stage "
+        "takes over such a PRN's search seed and slews it; a detection hands it back. The "
+        "search then scans unlocked satellites and those the model cannot seed. Off by "
+        "default.",
     )
     ap.add_argument(
         "--search-margin-hz",
@@ -933,6 +934,25 @@ def build_parser(description):
         default=500.0,
         help="Doppler hint half-window, Hz, once the clock-frequency bias is solved "
         "and fresh (--narrow-search)",
+    )
+    ap.add_argument(
+        "--warm-search-prns",
+        type=int,
+        default=0,
+        help="with --narrow-search on a GPS, Galileo or BeiDou chain, hint this many of the "
+        "PRNs no orbit source predicts at a time, over the whole MEO Doppler range about the "
+        "clock bias, rotating every few seconds (searchhint.WARM_DWELL_S), and seed what "
+        "they find. Only while neither the BRDC, the decoders' almanacs nor the TLEs list "
+        "the constellation: a receiver with no network whose cache holds a few of its "
+        "satellites. 0 (default) = off.",
+    )
+    ap.add_argument(
+        "--warm-search-min-snr",
+        type=float,
+        default=0.0,
+        help="the least search SNR at which a PRN no orbit predicts is seeded: with no "
+        "prediction to corroborate it, a detection must clear the noise of the warm search's "
+        "wide window. 0 (default): --acquire-snr alone.",
     )
     ap.add_argument(
         "--search-margin-wide-hz",
@@ -1433,6 +1453,15 @@ def build_parser(description):
         "Default %(default)s.",
     )
     ap.add_argument(
+        "--joint-clk-coast-bound",
+        action="store_true",
+        help="'clk' consumer without --joint-clk-primary: refuse a coast that would move this "
+        "chain's clock further than an adoption may (joint_clk_max_chips). After the legacy "
+        "clock steps (a declared re-pin once the capture re-based) the last adopted joint "
+        "clock is far from it, and coasting on it holds every seed on the clock from before "
+        "the step. Default off.",
+    )
+    ap.add_argument(
         "--joint-clk-coast-max-s",
         type=float,
         default=300.0,
@@ -1449,6 +1478,45 @@ def build_parser(description):
         "is a plain REFUSED on the legacy clock, the local clock goes stale and the "
         "cross-band bootstrap can re-arm. 0 disables the coast. Default "
         "%(default)s.",
+    )
+    ap.add_argument(
+        "--no-timebase-vote",
+        action="store_true",
+        help="this chain's search detections do not vote in the time-base detector "
+        "(gnss_broker/timebase.py), whose verdict is shared by every chain in the process and "
+        "withholds every chain's geometry while it stands. For a chain whose Doppler residuals "
+        "spread for reasons other than the epoch: GLONASS L2OF's FDMA search (near-horizon "
+        "detections, twin slots on one carrier) raised 42 of the 43 verdicts on 11-25. Off by "
+        "default.",
+    )
+    ap.add_argument(
+        "--extra-nav",
+        default="",
+        help="comma-separated RINEX nav files or glob patterns, read after the BRDC sources "
+        "(gnss_brdc_supply.EXTRA_NAV) for satellites no broadcast product carries: "
+        "gnss_oddsat_pointing.py's TLE-derived records. Process-wide: give it in the common "
+        "section. Broadcast records win any same-toe tie. Empty = none.",
+    )
+    ap.add_argument(
+        "--joint-no-feed",
+        action="store_true",
+        help="run this chain's --joint-consume consumers without its detections feeding the "
+        "search-fed joint state (dr_joint_shadow): for a chain whose satellites' clocks are "
+        "known only to microseconds (GuoWang's TLE records), which would add nothing to the "
+        "receiver's clock but noise. The consumers read the state the other chains feed. Off "
+        "by default.",
+    )
+    ap.add_argument(
+        "--joint-clk-primary",
+        action="store_true",
+        help="'clk' consumer on a --joint-source trk chain (docs/CHORD_JOINT_TRACKING.md "
+        "6.3 step 4): the tracker-fed joint clock is the level. It is adopted without the "
+        "joint_clk_max_chips bound against the legacy clock (the search median or a "
+        "sibling's); the sigma bound, the step guard and the clock-mod-epoch period check "
+        "stand. While TRK_STATE is stale or unfit the chain coasts on its last adoption of "
+        "it, within --joint-clk-coast-max-s and at a stamped rate within "
+        "joint_max_rate_ppm, instead of reading the search-fed state, which bootstraps it "
+        "only once that window has closed. Off by default.",
     )
     ap.add_argument(
         "--rrate-state",
@@ -1633,6 +1701,27 @@ def build_parser(description):
         "acceleration of ~0.2 m/s^2 gives ~0.4 m (0.013 L5 chips) at 2 s. Ages, rrate "
         "updates and the joint cycle stay at now. Needs the F-engine axis sample from "
         "--combiner's status. 0 (default) = seeds for now.",
+    )
+    ap.add_argument(
+        "--decoded-eph-file",
+        help="comma-separated decoded-ephemeris files (nav_decode.py --eph-out) or ephemeris "
+        "cache directories (eph_cache.py, every *.json in it): their ephemerides join this "
+        "broker's own decoders' in the decoded-ephemeris fallback, which dead-reckons while no "
+        "BRDC ephemeris is loaded (decoded_eph.py). Each file is re-read when it changes. "
+        "Unset = the broker's own decoders only.",
+    )
+    ap.add_argument(
+        "--fe-axis-future-s",
+        type=float,
+        default=0.05,
+        help="how far past this cycle's frozen clock the newest pow_hop in --combiner's "
+        "status may lie and still be the F-engine axis; a newer one is a corrupt or "
+        "forecast-epoch row and is dropped. The status is fetched partway through the "
+        "cycle, so on a pipeline whose newest record is only tens of ms old the true "
+        "newest row can lie past the cycle's clock by the stages before the fetch. A "
+        "dropped row stops the axis advancing, which dr_clock_freeze_s then reads as "
+        "a stall. Keep it under --dr-forecast-lead-s where that is set: birth rows "
+        "echo the forecast-epoch seed hop.",
     )
     ap.add_argument(
         "--model-primacy-max",
@@ -1834,6 +1923,15 @@ def build_parser(description):
         "32 records, ~0.34 s. Under --comb-taps-cpp the comb DLL and the prompt C/N0 "
         "take the gather's depth instead (FLEET_TRIM_TAPS_WINDOWS in "
         "config/gen_chord_gnss_config.py), which must equal this.",
+    )
+    ap.add_argument(
+        "--telem-depth",
+        type=int,
+        default=256,
+        help="windows each chain's gathered-telemetry ring holds (telem.shared_client). The "
+        "fleet ADR folds every window since its last pass, so the ring must outlast the "
+        "longest broker cycle or its arcs break: 256 is ~10.7 s of CHORD's 42 ms windows. A "
+        "receiver with shorter windows needs more (the bladeRF's 4 ms windows: 768, ~3 s).",
     )
     # -- Per-element gains (gnss_broker/elemgain.py) -------------------------------------------
     ap.add_argument(
@@ -2133,7 +2231,7 @@ def build_parser(description):
         "--nh-joint",
         type=str,
         default="off",
-        choices=["off", "apply"],
+        choices=["off", "apply", "model"],
         help="the joint NH overlay fit. The overlay is synchronous at the "
         "transmitters, so the satellites' received overlay alignments differ only by "
         "their predicted transmit times plus one common unknown, the receiver clock "
@@ -2148,9 +2246,11 @@ def build_parser(description):
         "a warning that the consensus or the prediction may be wrong. While "
         "this chain's search solve is established, the resolved offset is also "
         "published as its clock-mod-epoch record, which --dr-clock-adopt needs on a "
-        "chain whose code period is longer than this one's. Needs --almanac and the "
-        "capture time anchor (--time0-endpoint, read under --dead-reckon). Default "
-        "off.",
+        "chain whose code period is longer than this one's. 'model': no votes; the "
+        "offset is the receiver clock from a sibling chain's clock-mod-epoch record, "
+        "for a search that cannot see its own overlay segment (SBAS L5's Manchester "
+        "pair in 1 ms windows). Needs --almanac and the capture time anchor "
+        "(--time0-endpoint, read under --dead-reckon). Default off.",
     )
     ap.add_argument(
         "--nh-joint-min-snr",
@@ -2235,6 +2335,15 @@ def build_parser(description):
         "chips per second; until the bias is solved, as solve.",
     )
     ap.add_argument(
+        "--dr-drift-joint",
+        action="store_true",
+        help="a chain that takes both the joint clock and its rate (joint-consume clk,rate) "
+        "runs its clock at the joint rate (dr_joint_rate, under its gates) between adoptions "
+        "and through a refusal, instead of the measured drift or (l-a). A chain whose locked "
+        "satellites go unsearched (--hint-skip-dr) has no fresh solves to measure a drift "
+        "from, and a stale one walked 5 chips in 6 min. Default off.",
+    )
+    ap.add_argument(
         "--dr-nav-symbols",
         action="store_true",
         help="post nav_frame_at_ref with every dead-reckoned seed: the absolute symbol index "
@@ -2296,6 +2405,26 @@ def build_parser(description):
         "this chain's Doppler residuals. For a chain whose residuals do not measure the "
         "receiver: LEO satellites (GuoWang), whose TLE Doppler is 10-25 ppb off and whose "
         "Doppler moves 100 Hz/s, so a detection half a second old reads 50 Hz off.",
+    )
+    ap.add_argument(
+        "--freq-bias-joint",
+        action="store_true",
+        help="a cycle with no clock-frequency bias solved from this chain's Doppler residuals "
+        "takes it from the joint state's clock rate (the --joint-source state, under the "
+        "joint_min_sats and joint_max_rate_ppm gates), scaled to this chain's carrier, before "
+        "any other chain's solve (--freq-bias-adopt). On a fleet where every visible satellite "
+        "is locked the search detects nothing and the solved bias goes stale "
+        "(bias_stale_s), which widens every hint to --search-margin-wide-hz. Off by default.",
+    )
+    ap.add_argument(
+        "--dr-clock-publish",
+        type=int,
+        default=1,
+        help="0: this chain's dead-reckon clock stays its own, never offered to the shared "
+        "Receiver, so no other chain bootstraps or adopts from it. For a chain whose solve "
+        "carries a model bias of its own: the SBAS GEOs sit ~16 chips off their BRDC model in "
+        "common, and with a fast search their chain solved first after a restart and became "
+        "B3I's bootstrap donor. Default 1.",
     )
     ap.add_argument(
         "--dr-clock-adopt-max-chips",
