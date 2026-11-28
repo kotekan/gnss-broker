@@ -88,7 +88,10 @@ common:
   # (gnss_oddsat_rinex.py, one RINEX file a day on the shared home), merged with BRDC per
   # satellite, BRDC winning a same-toe tie. Today only slot 25, the spare COSMOS 2433 (k = 8),
   # whose records carry health 1: tracked and projected, kept out of the shared estimates.
-    extra-nav: /home/gnss_tunnel/oddsats/gx10_nav/gx10_decoded_*.rnx
+  # Then CHORD's own pointing records (gnss_oddsat_pointing.py, TLE orbits with an unknown clock)
+  # for BeiDou-3S M2-S (C58), whose broadcast D1 is unusable: seeded by the search (bds_b2a) and
+  # from bds_b2a's track (bds_b2b, bds_b3i), never from the model.
+    extra-nav: /home/gnss_tunnel/oddsats/gx10_nav/gx10_decoded_*.rnx,/home/kvand/gnss/fixtures/obs/oddsat_pointing/chord_pointing.rnx
   # One publisher serves every chain (broker_multi.py takes the first publish-port); select a
   # chain with /<chain>/get_status or ?chain=<id>.
     publish-port: 12060
@@ -497,6 +500,16 @@ chains:
     # is BDS-3 only: the IGS registry's block types decide which PRNs carry it (C11-C14 are
     # BDS-3 MEOs on re-used BDS-2 PRNs); if it proves nothing, PRNs below 19 are not seeded.
         signal: bds_b2a
+    # C58 (BeiDou-3S M2-S) has a TLE orbit and no clock, so the model cannot seed it: the
+    # aggregator's bds_b2a_search, on its own B2a pilot code, seeds it and nothing else
+    # (detectors-prns); every other PRN stays model-seeded and slewed as before. Its detections
+    # neither set the clock-frequency bias, vote on the time base nor feed the joint state.
+        detectors: http://localhost:12050/bds_b2a_search
+        detectors-prns: "58"
+        narrow-search: true
+        freq-bias-adopt: true
+        no-timebase-vote: true
+        joint-no-feed: true
         joint-trk-feed: true
         dr-clock-adopt: true
         joint-source: trk
@@ -581,6 +594,10 @@ chains:
         presence-admit-displaced: true
         seed-phase-transport: true
         signal: bds_b2b
+        # C58 (BeiDou-3S M2-S), with no orbit and clock to half a chip, is seeded from bds_b2a's
+        # track: the same code epoch, the Doppler scaled by the carrier ratio.
+        seed-from-chain: bds_b2a
+        seed-from-prns: "58"
         # The streamed data symbols' index on every seed (the node's set_nav_symbols wipe).
         dr-nav-symbols: true
         joint-trk-feed: true
@@ -735,6 +752,9 @@ chains:
         gdv-map: config/gdvmap_taua_20261030.json
         gdv-band: bds_b3i
         signal: bds_b3i
+        # C58 from bds_b2a's track, as on bds_b2b.
+        seed-from-chain: bds_b2a
+        seed-from-prns: "58"
         joint-trk-feed: true
         dr-clock-adopt: true
         seed-phase-transport: true

@@ -27,8 +27,8 @@ decoded issues age out, the satellite's pointing records come back for its next 
 
 --sats: SYS PRN : NORAD catalogue number [: GLONASS frequency channel]. Several PRNs may share
 one satellite (twin slots for an unknown channel, or candidate codes). The TLEs come from
-CelesTrak by catalogue number, cached in ~/.cache/kotekan_gps/oddsat_tle for TLE_MAX_AGE_S and
-used from the cache when the network fails.
+CelesTrak by catalogue number, cached in ~/.cache/kotekan_gps/oddsat_tle (or $GNSS_ODDSAT_TLE_DIR)
+for TLE_MAX_AGE_S and used from the cache when the network fails.
 """
 
 import argparse
@@ -44,7 +44,9 @@ from sgp4.api import Satrec, jday
 
 import gnss_ephemeris as ge
 
-TLE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "kotekan_gps", "oddsat_tle")
+TLE_DIR = os.environ.get("GNSS_ODDSAT_TLE_DIR") or os.path.join(
+    os.path.expanduser("~"), ".cache", "kotekan_gps", "oddsat_tle"
+)
 TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?CATNR=%d&FORMAT=TLE"
 TLE_MAX_AGE_S = 12 * 3600.0
 J2 = 1.08262668e-3

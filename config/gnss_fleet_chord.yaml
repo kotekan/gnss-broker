@@ -55,15 +55,25 @@ aggregator:
         #                      since 10-18); drop it when that ends.
         #   GPS_L5_Q:131,...   gps_l5_search, the WAAS GEOs on the L5 Q code (10-20 SBAS test, KV's
         #                      call; sbas_l5 tracks SBAS_L5_I_MC from the model).
-        #   BDS_B2A_P          bds_b2a_search, a code test on BeiDou-3S M2-S (registry PRN C58, on
-        #                      no chain and not in BRDC), hinted from its TLE, the tracked PRNs as
-        #                      controls (11-27, KV's call); drop it when the test ends.
+        #   BDS_B2A_P:58       bds_b2a_search, BeiDou-3S M2-S (C58) on its own B2a pilot code
+        #                      (bds3s-prns below), hinted from its TLE pointing record by bds_b2a
+        #                      (detectors-prns 58): the seed the model cannot give it (no clock).
         aggregator-extra-search:
             - GAL_E5A_Q
             - "GPS_L5_Q:131,133,135"
+            - "BDS_B2A_P:58"
+        # B2a's 100-chip pilot secondary is per PRN, so the search measures each detection's
+        # alignment (nh_sync): C58's clock is known only to ~1 ms, which cannot pick the period.
+        aggregator-nh-sync:
             - BDS_B2A_P
+        # PRNs on the BeiDou-3S codes (beidou3sCode.hpp), as in common.
+        bds3s-prns: "58"
 
 common:
+    # BeiDou-3S M2-S (C58) on its own codes (beidou3sCode.hpp, measured from the sky 11-28): the root
+    # key bds3s_prns, which every stage that builds a replica bank reads. C58 is in the prns of
+    # bds_b2a (search-seeded), bds_b2b and bds_b3i (seeded from bds_b2a's track).
+    bds3s-prns: "58"
     # GnssN2Project's channel loop on two cpus per GPU, a hyperthread pair (#225): proj_0 15+47, proj_1 19+51,
     # num_workers 2. The single-thread stage ran at 87-95% of its core and its stalls tripped the capture
     # (11-25 "stream is out of step"). Needs a binary with 14face496. The pair is a whole physical core
@@ -601,7 +611,7 @@ chains:
     - id: 3
       key: bds_b2a
       descriptor: BDS_B2A_P_CS
-      prns: 6,7,8,11,12,13,14,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42
+      prns: 6,7,8,11,12,13,14,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,58
       dll-spacing-chips: 0.5
       telem-rows: 24
       proj-sys: C
@@ -624,7 +634,7 @@ chains:
     - id: 5
       key: bds_b2b
       descriptor: BDS_B2B_I
-      prns: 6,7,8,11,12,13,14,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42
+      prns: 6,7,8,11,12,13,14,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,58
       dll-spacing-chips: 0.5
       telem-rows: 24
       proj-sys: C
@@ -653,7 +663,7 @@ chains:
     - id: 7
       key: bds_b3i
       descriptor: BDS_B3I_NH
-      prns: 6,7,8,11,12,13,14,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42
+      prns: 6,7,8,11,12,13,14,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,58
       dll-spacing-chips: 0.5
       telem-rows: 24
       proj-sys: C

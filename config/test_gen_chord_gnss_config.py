@@ -294,6 +294,82 @@ def test_headers_carry_the_iface_stamp():
     )
 
 
+def test_bds3s_prns_root_key():
+    """--bds3s-prns is the root key bds3s_prns of the aggregator config (and the node's), which
+    every replica-building stage inherits; absent without the flag, refused outside 1..63."""
+    agg = ["--aggregator-instance", "cx19", "--aggregator-cores", "0,1,2,3,4,5"]
+    for extra, want in (([], None), (["--bds3s-prns", "58"], [58])):
+        rc, out, _ = run_gen("--base", BASE, "--node", "cx19", *agg, *extra)
+        got = yaml.safe_load(out).get("bds3s_prns") if rc == 0 else "rc %d" % rc
+        check(got == want, "aggregator %s: bds3s_prns %r" % (extra, got))
+    rc, _, err = run_gen("--base", BASE, "--node", "cx19", *agg, "--bds3s-prns", "64")
+    check(rc != 0 and "1..63" in err, "--bds3s-prns 64 is refused (rc %d)" % rc)
+    if kotekan_src.SRC is None:
+        print("  [SKIP] node config: no kotekan tree to render the base from")
+        return
+    names = (
+        "choco_eop_table",
+        "live_eop_table",
+        "choco_bad_inputs",
+        "live_bad_inputs",
+        "live_frame0_utc",
+        "stock_render_vars",
+    )
+    real = {n: getattr(g, n) for n in names}
+    for n in names:
+        setattr(g, n, lambda *a, **k: None)
+    try:
+        base = kotekan_src.src("config", "chord/pathfinder.j2")
+        argv = [
+            "--base",
+            base,
+            "--node",
+            "cx19",
+            "--telem-host",
+            "gnss",
+            "--cube-host",
+            "cf06",
+        ]
+        exc, out, _ = run_main(argv + ["--bds3s-prns", "58"])
+    finally:
+        for n, f in real.items():
+            setattr(g, n, f)
+    got = yaml.safe_load(out).get("bds3s_prns") if exc is None else exc
+    check(got == [58], "node config: bds3s_prns %r" % (got,))
+
+
+def test_aggregator_nh_sync():
+    """--aggregator-nh-sync SIGNAL turns that extra search from nh_search to nh_sync, and only
+    that one; a signal with no extra search is refused."""
+    agg = ["--aggregator-instance", "cx19", "--aggregator-cores", "0,1,2,3,4,5"]
+    ex = [
+        "--aggregator-extra-search",
+        "GAL_E5A_Q",
+        "--aggregator-extra-search",
+        "BDS_B2A_P:58",
+    ]
+    rc, out, _ = run_gen(
+        "--base", BASE, "--node", "cx19", *agg, *ex, "--aggregator-nh-sync", "BDS_B2A_P"
+    )
+    c = yaml.safe_load(out) if rc == 0 else {}
+    b, e = c.get("bds_b2a_search", {}), c.get("gal_e5a_search", {})
+    check(
+        b.get("nh_sync") is True and b.get("nh_search") is False,
+        "bds_b2a_search: nh_sync on, nh_search off (rc %d)" % rc,
+    )
+    check(
+        "nh_sync" not in e and e.get("nh_search") is True,
+        "gal_e5a_search keeps nh_search",
+    )
+    rc, _, err = run_gen(
+        "--base", BASE, "--node", "cx19", *agg, "--aggregator-nh-sync", "BDS_B2A_P"
+    )
+    check(
+        rc != 0 and "not an" in err,
+        "nh-sync without its search is refused (rc %d)" % rc,
+    )
+
+
 def test_unknown_descriptor_is_refused():
     for flags, where in (
         (["--gather-instance", "--extra-signal", "GPS_L9_X:1,2"], "--extra-signal"),

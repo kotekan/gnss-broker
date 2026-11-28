@@ -122,6 +122,12 @@ DECLARED = [
         "+",
         "that output's host buffer",
     ),
+    (
+        "bds3s_prns",
+        "+",
+        "BeiDou-3S PRNs (--bds3s-prns): a root key so every GNSS stage's replica bank inherits "
+        "it; no stock stage reads it",
+    ),
 ]
 # Values stock gets by REST at runtime; the generator injects the current ones. Different from
 # the bare render by design, and equal to a live stock node's, so --live does not allow them.
